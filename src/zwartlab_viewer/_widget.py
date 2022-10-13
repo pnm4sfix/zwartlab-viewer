@@ -8,39 +8,429 @@ Replace code below according to your needs.
 """
 from typing import TYPE_CHECKING
 
-from magicgui import magic_factory
-from qtpy.QtWidgets import QHBoxLayout, QPushButton, QWidget
+
+from qtpy.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+from magicgui.widgets import ComboBox, Container, PushButton, SpinBox, FileEdit, FloatSpinBox, Label, TextEdit
+from magicgui.widgets import create_widget, Widget
+import napari_plot
+from napari_plot._qt.qt_viewer import QtViewer
+import os
+import pandas as pd
+from dask_image.imread import imread
+import dask.dataframe as dd
+import dask.array as da
+import numpy as np
 
 if TYPE_CHECKING:
     import napari
 
 
-class ExampleQWidget(QWidget):
+class ExampleQWidget(Container):
     # your QWidget.__init__ can optionally request the napari viewer instance
     # in one of two ways:
     # 1. use a parameter called `napari_viewer`, as done here
     # 2. use a type annotation of 'napari.viewer.Viewer' for any parameter
+    # This should be the registration widget
+    
+
+
     def __init__(self, napari_viewer):
+        
         super().__init__()
         self.viewer = napari_viewer
+        self.fr = 3.07
+        # Fish data
+        self.fish = FileEdit(value='./Select reference image', tooltip = "Select fish folder", mode ="d")
+        
+        # Exploration widgets
+        self.stim_menu = ComboBox(label='Stim', choices = ["visual", "flow", "motion", "visualmotion", "visualflow"],
+                                 tooltip = "Select stim")
+        self.trial_menu = ComboBox(label='Trial', choices = [], tooltip = "Select trial")
+        self.angle_menu = ComboBox(label='Angle', choices = [], tooltip = "Select angle")
+        self.velocity_menu = ComboBox(label='Velocity', choices = [], tooltip = "Select velocity")
+        self.visual_angle_menu = ComboBox(label='Visual Angle', choices = [], tooltip = "Select visual angle (combo exps only)")
+        self.visual_velocity_menu = ComboBox(label='Visual Velocity', choices = [], tooltip =  "Select visual velocity (combo exps only)")
+        self.fish.changed.connect(lambda x: self.load_fish_data(x))
+        self.extend([self.fish, self.stim_menu, self.trial_menu, self.angle_menu, self.velocity_menu,
+                             self.visual_angle_menu, self.visual_velocity_menu])
 
-        btn = QPushButton("Click me!")
-        btn.clicked.connect(self._on_click)
+        self.stim_menu.changed.connect(self.stim_changed)
+        self.trial_menu.changed.connect(self.trial_changed)
+        self.angle_menu.changed.connect(self.angle_changed)
+        self.velocity_menu.changed.connect(self.velocity_changed)
 
-        self.setLayout(QHBoxLayout())
-        self.layout().addWidget(btn)
+        # Registration widgets
+        registration_label = Label(name = "Registration", label = "Registration")
+        self.translate_x = FloatSpinBox(label = "translate x", tooltip = "change x translation", min = -500, max = 500, value = 0)
+        self.translate_y = FloatSpinBox(label = "translate y", tooltip = "change y translation", min = -500, max = 500, value = 0)
+        self.translate_z = FloatSpinBox(label = "translate z", tooltip = "change z translation", min = -500, max = 500, value = 0)
+        self.affine_name = TextEdit(label = "affine filename", value = "affine.npy")
+        self.save_affine_button = PushButton(label = "save affine")
+        
+        self.translate_x.changed.connect(self.translate)
+        self.translate_y.changed.connect(self.translate)
+        self.translate_z.changed.connect(self.translate)
+        self.save_affine_button.clicked.connect(self.save_starting_affine)
+        
+        
+        self.extend([ registration_label,
+                    self.translate_x, self.translate_y, self.translate_z, 
+                    self.affine_name, self.save_affine_button])
+        
+        
+        # Create napari1d instances
+        self.add_dff_widget() # overlay ephys data on top
+        
+    #### Load all dataframes, images, transform matrices #############################################
 
-    def _on_click(self):
-        print("napari has", len(self.viewer.layers), "layers")
+    def load_fish_data(self, event):
+        
+        self.root_folder = event
+        # define denoised folder - where all data is
+        self.denoised_dir = os.path.join(self.root_folder, "denoised")
+
+        # define overview folder - where wholebrain overview is
+        self.overview_dir = os.path.join(self.root_folder, "overview")
+
+        # Load volume df 
+        vol_path = os.path.join(self.denoised_dir, "volume_df.h5")
+        self.volume_df = pd.read_hdf(vol_path)
+
+        # Load coms df 
+        coms_path = os.path.join(self.denoised_dir, "all_neuron_centers.h5")
+        self.coms_df = pd.read_hdf(coms_path)
+
+        # Load con_df
+        con_path = os.path.join(self.denoised_dir, "all_neuron_contours.h5")
+        self.con_df = pd.read_hdf(con_path)
+
+        # Load dff_df
+        self.dff_path = os.path.join(self.denoised_dir, "df.parquet.gzip")
+        
+        # read this dff on fly using cell_id as filter
+        # default cell id is 0
+        
+
+        # Load fluorescence data - returns self.im
+        self.lazy_load_images()
+
+        # load overview, overview_grid_to_world
+        overview_dir = os.path.join(os.path.dirname(self.denoised_dir), "overview")
+        try:
+            overview_file = [os.path.join(overview_dir, file) for file in os.listdir(overview_dir) if "overview" in file][0]
+        
+            self.overview_im  = da.rot90(da.rot90(imread(overview_file), axes = (1, 2)), axes = (1, 2))
+        except:
+            print("No overview file")
+            self.overview_im = None
+
+        self.overview_grid_to_world = np.array([[ 1.,    0.,         0.,          0.],
+                                         [0.,   0.01171,   0.,            0.],
+                                         [0.,   0.,         0.01171,      0.],
+                                         [0.,   0.,         0.,           1.]])
+
+        # load io template, io_grid_to_world, io_to_overview 
+        io_template_path = os.path.join(self.denoised_dir, "io_template.tif")
+        io_grid_path = os.path.join(self.denoised_dir, "io_grid2world.npy")
+        io_affine_path = os.path.join(self.denoised_dir, "io_affine.npy")
+
+        if os.path.exists(io_template_path):
+            self.io_template =  imread(io_template_path)
+        else:
+            self.io_template = None
+
+        if os.path.exists(io_grid_path):
+            self.io_grid2world = np.load(io_grid_path)
+        else:
+            self.io_grid2world = None
+
+        if os.path.exists(io_affine_path):  
+            self.io_affine = np.load(io_affine_path)
+        else:
+            self.io_affine = None
 
 
-@magic_factory
-def example_magic_widget(img_layer: "napari.layers.Image"):
-    print(f"you have selected {img_layer}")
+        # load zbrain reference
+        self.reference_brain = da.rot90(
+                                    da.rot90(
+                                    da.flip(imread(r"Z:\Pierce\Elavl3-H2BRFP\Elavl3-H2BRFP_rotated.tif"), 
+                                            axis=0), axes = (1, 2)), axes = (1, 2))
+        # maybe need an affine map button to select whether images should be mapped to zbrain reference
+        self.set_default_filters()
+        self.add_layers()
+        self.load_subset()
+
+    def add_layers(self):
+
+        if isinstance(self.io_template, (np.ndarray, da.core.Array)):
+            self.template_layer = self.viewer.add_image(self.io_template, name = "IO Template", opacity = 0.5)
+
+        if isinstance(self.im, (np.ndarray, da.core.Array)):
+            print(self.im.shape)
+            self.denoised_layer = self.viewer.add_image(np.zeros((self.im.shape[0], *self.im.shape[2:])), 
+                                                        name = "Denoised Recording", opacity = 0.5)
+        print(self.template_layer, self.denoised_layer)
+        print(self.viewer.layers)
+
+    def set_default_filters(self):
+        self.cell_id = 0 
+        self.cell_subset = dd.read_parquet(self.dff_path, filters = [("cell_id", "==", self.cell_id)]).compute()
+
+        stims = self.volume_df.stim.dropna().unique().tolist()
+        #[print(type(stim), stim) for stim in stims]
+        #self.stim_menu.choices = stims
+        print(self.stim_menu.choices)
+        self.stim = stims[0]
+        self.stim_subset = self.volume_df[self.volume_df.stim == self.stim]
+
+    def stim_changed(self, event):
+        print(self.volume_df.trial.unique())
+        self.stim = event
+        self.stim_subset  = self.volume_df[self.volume_df.stim == self.stim]
+        self.update_menu_choices()
+        self.load_subset()
+        print(event)
+
+    def trial_changed(self, event):
+        self.trial = event
+        self.load_subset()
+        print("new trial {}".format(event))
+        
+    def angle_changed(self, event):
+        self.angle = event
+        self.load_subset()
+        
+        print("new angle {}".format(event))
+        
+    def velocity_changed(self, event):
+        self.velocity = event
+        self.load_subset()
+        print("new velocity {}".format(event))
+        
+        
+    def load_subset(self):
+        # load subset data
+        self.update_menu_choices()
+        self.get_volume_subset()
+        
+        if self.volume_subset.shape[0] > 0:
+            
+            self.load_image()
+            self.plot_cell(self.cell_id)
+        
+
+    def update_menu_choices(self):
+        
+        trials = self.stim_subset.trial.sort_values().dropna().unique().tolist()
+        angles = self.stim_subset.angle.sort_values().dropna().unique().tolist()
+        velocities = self.stim_subset.velocity.sort_values().dropna().unique().tolist()
+        
+        self.angle = angles[0]
+        self.velocity = velocities[1]
+        self.trial = trials[0]
+        
+        # initiates change loop
+        self.trial_menu.choices = trials
+        self.angle_menu.choices = angles
+        self.velocity_menu.choices = velocities
+
+        if "visual_angle" in self.stim_subset.columns:
+            visual_angles = self.stim_subset.visual_angle.dropna().unique().tolist()
+            self.visual_angle = visual_angles[0]
+
+            visual_velocities = self.stim_subset.visual_vel.dropna().unique().tolist()
+            self.visual_velocity = visual_velocities[0]
+
+            self.visual_angle_menu.choices = visual_angles
+            self.visual_velocity_menu.choices = visual_velocities
+
+        else:
+            self.visual_angle = None
+            self.visual_velocity = None
+
+    def update_filters(self, df):
+        print(self.stim, self.angle, self.velocity, self.trial)
+        stim_filter = df.stim == self.stim
+        angle_filter = df.angle == self.angle
+        velocity_filter = df.velocity == self.velocity
+        trial_filter = df.trial == self.trial
+
+        if self.visual_angle != None:
+            visual_angle_filter = df.angle == self.visual_angle
+            visual_velocity_filter = df.velocity == self.visual_velocity
+        else:
+            visual_angle_filter = None
+            visual_velocity_filter = None
+
+        filter_dict = {}
+
+        filter_dict["stim"] = stim_filter
+        filter_dict["angle"] = angle_filter
+        filter_dict["velocity"] = velocity_filter
+        filter_dict["trial"] = trial_filter
+        filter_dict["visual_angle"] = visual_angle_filter
+        filter_dict["visual_velocity"] = visual_velocity_filter
+
+        return filter_dict
+
+    def get_volume_subset(self):
+        filters = self.update_filters(self.volume_df)
+
+        if filters["visual_angle"] != None:
+            self.volume_subset = self.volume_df[(filters["stim"]) & (filters["angle"]) & (filters["velocity"])
+                                                & (filters["trial"]) & (filters["visual_angle"]) & (filters["visual_velocity"])]
+        else:
+            self.volume_subset = self.volume_df[(filters["stim"]) & (filters["angle"]) & (filters["velocity"])
+                                                & (filters["trial"])]
+        
+        if self.volume_subset.shape[0] > 0:
+         # 5 seconds before
+            vols_before = int(5 * self.fr)
+            
+            
+            self.cond_start  = self.volume_subset.nVol.iloc[0] 
+            self.cond_end = self.volume_subset.nVol.iloc[-1] 
+            self.first_vol = self.cond_start - vols_before
+            self.end_vol = self.cond_end + vols_before
+            self.vols = np.arange(self.first_vol, self.end_vol)
+            
+        
+
+    
 
 
-# Uses the `autogenerate: true` flag in the plugin manifest
-# to indicate it should be wrapped as a magicgui to autogenerate
-# a widget.
-def example_function_widget(img_layer: "napari.layers.Image"):
-    print(f"you have selected {img_layer}")
+
+    def lazy_load_images(self):
+        
+        print("loading images")
+        # load all images as one dask array - dask.array.stack(data = [],  axis = 0)
+        files = os.listdir(self.denoised_dir)
+        ims = [os.path.join(self.denoised_dir,file) for file in files if 'denoised' in file]
+        
+        da_ims = []
+
+        for im in ims:
+            da_im = imread(im, nframes = 1)
+            da_ims.append(da_im)
+        #self.im  = da.from_zarr(os.path.join(self.denoised_dir, "8bit.zarr"), chunks= (5, 1000, -1, -1))
+        
+        self.im = da.stack(da_ims)
+        
+        print("loading finished")
+
+   
+
+
+    #### Registration functions   #############################################
+
+    #### Exploration functions    #############################################
+    def load_image(self):
+        """Load image"""
+        if self.volume_subset.shape[0] > 0:
+            print("loading dask images")
+            self.denoised_layer.data = self.im[:, self.first_vol:self.end_vol ].compute()
+            print("images loaded")
+            
+        else:
+            print("no volumes")
+        pass
+    def plot_cell(self, event):
+        if self.stim != None:
+            self.clear_plot()
+            # define cell event
+            # get dff info for cell
+            # get contour of cell
+            self.cell = event
+
+            
+            self.cell_subset = dd.read_parquet(self.dff_path, filters = [("cell_id", "==", self.cell_id)]).compute()
+            filters = self.update_filters(self.cell_subset)
+            if filters["visual_angle"] != None:
+
+                self.dff_subset  = self.cell_subset[(filters["stim"]) & (filters["angle"]) & 
+                                    (filters["velocity"]) & (filters["visual_angle"]) &
+                                    (filters["visual_velocity"])]
+            else:
+                self.dff_subset  = self.cell_subset[(filters["stim"]) & (filters["angle"]) & 
+                                    (filters["velocity"])]
+
+            # plot every trial but highlight current one with thicker line
+
+            for trial in self.dff_subset.trial.unique():
+                trial_subset = self.dff_subset[self.dff_subset.trial == trial]
+                print(trial_subset.shape)
+                trial_start = trial_subset.nVol.iloc[0]
+                trial_end = trial_subset.nVol.iloc[-1]
+                vols_before = int(5 * self.fr)
+                first_vol = trial_start - vols_before
+                last_vol = trial_end + vols_before
+                vols = np.arange(first_vol, last_vol)
+                vol_filter = self.cell_subset.nVol.isin(vols)
+
+                plotting_subset = self.cell_subset[vol_filter]
+                t = np.arange(0, plotting_subset.shape[0]/self.fr, 1/self.fr)
+
+                if trial == self.trial:
+
+                    self.viewer1d.add_line(np.c_[t, plotting_subset.dff.to_numpy()], color = "magenta")
+                    regions = [
+                            ([t[trial_start-first_vol], t[trial_end-first_vol]], "vertical"),
+                        ]
+
+                    layer = self.viewer1d.add_region(
+                            regions,
+                            color=["green"],
+                            opacity = 0.4,
+                            name = "Stim",
+                        )
+
+                else:
+                    self.viewer1d.add_line(np.c_[t, plotting_subset.dff.to_numpy()], name="trial {}".format(trial), color="gray")
+
+
+
+                self.viewer1d.reset_view()
+        
+    def add_dff_widget(self):
+        
+        self.viewer1d = napari_plot.ViewerModel1D()
+        widget = QtViewer(self.viewer1d)
+        self.viewer.window.add_dock_widget(widget, area="bottom", name="DF/F Widget")
+        self.viewer1d.axis.x_label = "Time"
+        self.viewer1d.axis.y_label = "DeltaF/F"
+        self.viewer1d.reset_view()
+    
+    def clear_plot(self):
+        self.viewer1d.clear_canvas()
+
+    def translate(self, event):
+        
+        if self.moving_grid2world is not None:
+            # manually estimate translation
+            self.x = self.translate_x.value
+            self.y = self.translate_y.value
+            self.z = self.translate_z.value
+
+            self.grid_copy = np.eye(4)
+            self.grid_copy[2, -1] += self.x # x
+            self.grid_copy[1, -1] += self.y # y
+            self.grid_copy[0, -1] += self.z # z
+            
+            if len(self.overview_im.data.shape) > 2: # if not still empty array
+                self.template.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy, self.overview_im.data, self.template_orig)
+                
+            else:
+                self.template.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy, self.reference_brain.data, self.template_orig)
+            
+    def save_starting_affine(self):
+        #save affine transform
+        filename = self.affine_name.value
+        np.save(os.path.join(self.denoised_dir, filename), self.grid_copy)
+               
