@@ -17,7 +17,7 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from magicgui.widgets import ComboBox, Container, PushButton, SpinBox, FileEdit, FloatSpinBox, Label, TextEdit
+from magicgui.widgets import ComboBox, Container, PushButton, SpinBox, FileEdit, FloatSpinBox, Label, TextEdit, CheckBox
 from magicgui.widgets import create_widget, Widget
 import napari_plot
 from napari_plot._qt.qt_viewer import QtViewer
@@ -58,16 +58,29 @@ class ExampleQWidget(Container):
         self.visual_angle_menu = ComboBox(label='Visual Angle', choices = [], tooltip = "Select visual angle (combo exps only)")
         self.visual_velocity_menu = ComboBox(label='Visual Velocity', choices = [], tooltip =  "Select visual velocity (combo exps only)")
         self.fish.changed.connect(lambda x: self.load_fish_data(x))
+        self.cell_ids = SpinBox(label = "cell_id", tooltip = "change cell")
+        self.cell_ids.changed.connect(self.plot_cell)
         self.extend([self.fish, self.stim_menu, self.trial_menu, self.angle_menu, self.velocity_menu,
-                             self.visual_angle_menu, self.visual_velocity_menu])
+                             self.visual_angle_menu, self.visual_velocity_menu, self.cell_ids])
 
         self.stim_menu.changed.connect(self.stim_changed)
         self.trial_menu.changed.connect(self.trial_changed)
         self.angle_menu.changed.connect(self.angle_changed)
         self.velocity_menu.changed.connect(self.velocity_changed)
 
+        
+
         # Registration widgets
         registration_label = Label(name = "Registration", label = "Registration")
+        # Add check box - grey out if self io_affine etc is None - if checkbox is ticked all images and contours will be transformed
+        self.registration_checkbox = CheckBox(name = "Live registration enabled")
+
+        # Add dropdown to select appropriate channel for registration
+        self.channel_to_register_dropdown = ComboBox(label='Channel to Register', choices = [], tooltip =  "Select channel to register")
+        self.channel_to_register_to_dropdown = ComboBox(label='Channel to Register to', choices = [], tooltip =  "Select channel to register")
+
+
+
         self.translate_x = FloatSpinBox(label = "translate x", tooltip = "change x translation", min = -500, max = 500, value = 0)
         self.translate_y = FloatSpinBox(label = "translate y", tooltip = "change y translation", min = -500, max = 500, value = 0)
         self.translate_z = FloatSpinBox(label = "translate z", tooltip = "change z translation", min = -500, max = 500, value = 0)
@@ -80,7 +93,7 @@ class ExampleQWidget(Container):
         self.save_affine_button.clicked.connect(self.save_starting_affine)
         
         
-        self.extend([ registration_label,
+        self.extend([ registration_label, self.registration_checkbox, self.channel_to_register_dropdown, self.channel_to_register_to_dropdown,
                     self.translate_x, self.translate_y, self.translate_z, 
                     self.affine_name, self.save_affine_button])
         
@@ -110,6 +123,7 @@ class ExampleQWidget(Container):
         # Load con_df
         con_path = os.path.join(self.denoised_dir, "all_neuron_contours.h5")
         self.con_df = pd.read_hdf(con_path)
+        self.plot_all_contours()
 
         # Load dff_df
         self.dff_path = os.path.join(self.denoised_dir, "df.parquet.gzip")
@@ -164,20 +178,80 @@ class ExampleQWidget(Container):
                                             axis=0), axes = (1, 2)), axes = (1, 2))
         # maybe need an affine map button to select whether images should be mapped to zbrain reference
         self.set_default_filters()
+        self.update_menu_choices()
         self.add_layers()
         self.load_subset()
 
     def add_layers(self):
 
-        if isinstance(self.io_template, (np.ndarray, da.core.Array)):
-            self.template_layer = self.viewer.add_image(self.io_template, name = "IO Template", opacity = 0.5)
-
+        
         if isinstance(self.im, (np.ndarray, da.core.Array)):
             print(self.im.shape)
             self.denoised_layer = self.viewer.add_image(np.zeros((self.im.shape[0], *self.im.shape[2:])), 
                                                         name = "Denoised Recording", opacity = 0.5)
-        print(self.template_layer, self.denoised_layer)
+
+        if isinstance(self.rois, (np.ndarray, list)):
+            self.roi_layer = self.viewer.add_shapes(self.rois,shape_type = "polygon", edge_width=0.4,
+                                  edge_color='white', face_color='transparent', name = "ROIs")
+            self.roi_layer.events.highlight.connect(self.roi_selected)
+
+        if isinstance(self.io_template, (np.ndarray, da.core.Array)):
+            self.template_layer = self.viewer.add_image(self.io_template, name = "IO Template", opacity = 0.5, visible = False)
+
+        if isinstance(self.overview_im, (np.ndarray, da.core.Array)):
+            self.overview_im_layer = self.viewer.add_image(self.overview_im, name = "Overview", opacity = 0.5, visible = False)
+
+        if isinstance(self.reference_brain, (np.ndarray, da.core.Array)):
+            self.reference_brain_layer = self.viewer.add_image(self.reference_brain, name = "H2B:Elavl3", opacity = 0.5, visible = False)
+
+
+
+        #print(self.template_layer, self.denoised_layer)
         print(self.viewer.layers)
+
+    def plot_all_contours(self): # slow
+        
+        #try:
+        #if self.io_affine is not None:
+        #    io_affine = self.io_affine
+
+        #elif self.grid_copy is not None:
+        #    io_affine = self.grid_copy
+
+        #else:
+        #    io_affine = np.eye(4)
+
+        #self.transform_contours(io_affine, self.io_grid2world, self.ref_grid2world)
+            
+        #except:
+        #    print("error registering contours")
+        
+        z_index = [] 
+        shapes= []
+        for cell in self.con_df.cell_id.sort_values().unique():
+            subset = self.con_df[self.con_df.cell_id == cell].dropna().copy()
+            contours = subset[["z","cell_id", "y", "x"]]
+
+            contours.cell_id = np.zeros(contours.shape[0])
+
+
+            z_index.append(subset.iloc[0, 2])
+            
+            shapes.append(np.round_(contours.to_numpy(), 2))
+            
+        self.rois = shapes
+        #print(np.array(self.rois).shape)
+        self.roi_z = z_index
+        #self.roi_layer.selected_data = set(range(self.select_roi.nshapes))
+        #self.roi_layer.remove_selected()
+
+        #self.roi_layer.add(shapes,shape_type = "polygon", edge_width=0.4,
+        #                          edge_color='white', face_color='transparent')
+        
+    
+    def roi_selected(self, event):
+        if len(self.roi_layer.selected_data) > 0:
+            self.cell_ids.value = list(self.roi_layer.selected_data)[0]
 
     def set_default_filters(self):
         self.cell_id = 0 
@@ -190,34 +264,43 @@ class ExampleQWidget(Container):
         self.stim = stims[0]
         self.stim_subset = self.volume_df[self.volume_df.stim == self.stim]
 
+        self.visual_angle = None
+        
+
     def stim_changed(self, event):
         print(self.volume_df.trial.unique())
-        self.stim = event
-        self.stim_subset  = self.volume_df[self.volume_df.stim == self.stim]
-        self.update_menu_choices()
-        self.load_subset()
-        print(event)
+        if self.stim != event:
+            self.stim = event
+            self.stim_subset  = self.volume_df[self.volume_df.stim == self.stim]
+            self.update_menu_choices()
+            self.load_subset()
+            print(event)
 
     def trial_changed(self, event):
-        self.trial = event
-        self.load_subset()
-        print("new trial {}".format(event))
+        if self.trial != event:
+            self.trial = event
+            self.load_subset()
+            print("new trial {}".format(event))
         
     def angle_changed(self, event):
-        self.angle = event
-        self.load_subset()
+        if self.angle != event:
+            self.angle = event
+            self.load_subset()
         
         print("new angle {}".format(event))
         
     def velocity_changed(self, event):
-        self.velocity = event
-        self.load_subset()
-        print("new velocity {}".format(event))
+        print("velocity before {}".format(self.velocity))
+        if self.velocity != event:
+            self.velocity = event
+            print("velocity after {}".format(self.velocity))
+            self.load_subset()
+            print("new velocity {}".format(event))
         
         
     def load_subset(self):
         # load subset data
-        self.update_menu_choices()
+        
         self.get_volume_subset()
         
         if self.volume_subset.shape[0] > 0:
@@ -227,7 +310,7 @@ class ExampleQWidget(Container):
         
 
     def update_menu_choices(self):
-        
+        # should only be called if new stim
         trials = self.stim_subset.trial.sort_values().dropna().unique().tolist()
         angles = self.stim_subset.angle.sort_values().dropna().unique().tolist()
         velocities = self.stim_subset.velocity.sort_values().dropna().unique().tolist()
@@ -311,17 +394,17 @@ class ExampleQWidget(Container):
         
         print("loading images")
         # load all images as one dask array - dask.array.stack(data = [],  axis = 0)
-        files = os.listdir(self.denoised_dir)
-        ims = [os.path.join(self.denoised_dir,file) for file in files if 'denoised' in file]
+        #files = os.listdir(self.denoised_dir)
+        #ims = [os.path.join(self.denoised_dir,file) for file in files if 'denoised' in file]
         
-        da_ims = []
+        #da_ims = []
 
-        for im in ims:
-            da_im = imread(im, nframes = 1)
-            da_ims.append(da_im)
-        #self.im  = da.from_zarr(os.path.join(self.denoised_dir, "8bit.zarr"), chunks= (5, 1000, -1, -1))
+        #for im in ims:
+        #    da_im = imread(im, nframes = 1)
+        #    da_ims.append(da_im)
+        self.im  = da.from_zarr(os.path.join(self.denoised_dir, "8bit.zarr"), chunks= (5, 1000, -1, -1))
         
-        self.im = da.stack(da_ims)
+        #self.im = da.stack(da_ims)
         
         print("loading finished")
 
@@ -336,22 +419,32 @@ class ExampleQWidget(Container):
         if self.volume_subset.shape[0] > 0:
             print("loading dask images")
             self.denoised_layer.data = self.im[:, self.first_vol:self.end_vol ].compute()
+            self.denoised_layer.contrast_limits_range = (0, 255)
+            self.denoised_layer.contrast_limits = [0, 40]
+            #self.denoised_layer.reset_contrast_limits_range()
+            #self.denoised_layer.reset_contrast_limits()
+            
             print("images loaded")
             
         else:
             print("no volumes")
         pass
     def plot_cell(self, event):
-        if self.stim != None:
+        print(self.stim)
+        if type(self.stim) == str:
+            print("Changing cell")
             self.clear_plot()
             # define cell event
             # get dff info for cell
             # get contour of cell
-            self.cell = event
+            print(type(event))
+            self.cell_id = int(event)
+            print("New cell is {}".format(self.cell_id))
 
             
-            self.cell_subset = dd.read_parquet(self.dff_path, filters = [("cell_id", "==", self.cell_id)]).compute()
+            self.cell_subset = dd.read_parquet(self.dff_path, filters = [("cell_id", "==", str(self.cell_id))]).compute()
             filters = self.update_filters(self.cell_subset)
+            print(self.cell_subset.cell_id.unique())
             if filters["visual_angle"] != None:
 
                 self.dff_subset  = self.cell_subset[(filters["stim"]) & (filters["angle"]) & 
@@ -376,10 +469,11 @@ class ExampleQWidget(Container):
 
                 plotting_subset = self.cell_subset[vol_filter]
                 t = np.arange(0, plotting_subset.shape[0]/self.fr, 1/self.fr)
+                
 
                 if trial == self.trial:
 
-                    self.viewer1d.add_line(np.c_[t, plotting_subset.dff.to_numpy()], color = "magenta")
+                    self.viewer1d.add_line(np.c_[t, plotting_subset.smooth_dff.to_numpy()], color = "magenta")
                     regions = [
                             ([t[trial_start-first_vol], t[trial_end-first_vol]], "vertical"),
                         ]
@@ -392,11 +486,12 @@ class ExampleQWidget(Container):
                         )
 
                 else:
-                    self.viewer1d.add_line(np.c_[t, plotting_subset.dff.to_numpy()], name="trial {}".format(trial), color="gray")
+                    self.viewer1d.add_line(np.c_[t, plotting_subset.smooth_dff.to_numpy()], name="trial {}".format(trial), color="gray")
 
 
 
-                self.viewer1d.reset_view()
+            self.viewer1d.reset_view()
+            self.viewer1d.set_y_view(-0.05, 1.)
         
     def add_dff_widget(self):
         
