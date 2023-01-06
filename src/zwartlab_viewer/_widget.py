@@ -27,6 +27,13 @@ from dask_image.imread import imread
 import dask.dataframe as dd
 import dask.array as da
 import numpy as np
+import cupy as cp
+if cp.cuda.Device():
+    
+    from cudipy.align.imaffine import AffineMap        
+else:
+        
+    from dipy.align.imaffine import AffineMap
 
 if TYPE_CHECKING:
     import napari
@@ -44,6 +51,12 @@ class ExampleQWidget(Container):
     def __init__(self, napari_viewer):
         
         super().__init__()
+
+        if cp.cuda.Device():
+            self.gpu = True
+        else:
+            self.gpu = False
+
         self.viewer = napari_viewer
         self.fr = 3.07
         # Fish data
@@ -74,22 +87,27 @@ class ExampleQWidget(Container):
         registration_label = Label(name = "Registration", label = "Registration")
         # Add check box - grey out if self io_affine etc is None - if checkbox is ticked all images and contours will be transformed
         self.registration_checkbox = CheckBox(name = "Live registration enabled")
+        self.registration_checkbox.changed.connect(self.affine_map_all)
 
         # Add dropdown to select appropriate channel for registration
         self.channel_to_register_dropdown = ComboBox(label='Channel to Register', choices = [], tooltip =  "Select channel to register")
         self.channel_to_register_to_dropdown = ComboBox(label='Channel to Register to', choices = [], tooltip =  "Select channel to register")
 
+        self.channel_to_register_dropdown.changed.connect(self.update_registration_channels)
+        self.channel_to_register_to_dropdown.changed.connect(self.update_registration_channels)
 
 
         self.translate_x = FloatSpinBox(label = "translate x", tooltip = "change x translation", min = -500, max = 500, value = 0)
         self.translate_y = FloatSpinBox(label = "translate y", tooltip = "change y translation", min = -500, max = 500, value = 0)
         self.translate_z = FloatSpinBox(label = "translate z", tooltip = "change z translation", min = -500, max = 500, value = 0)
+        self.scale_xy = FloatSpinBox(label = "scale xy", tooltip = "change xy scale", min = -500, max = 500, value = 1)
         self.affine_name = TextEdit(label = "affine filename", value = "affine.npy")
         self.save_affine_button = PushButton(label = "save affine")
         
         self.translate_x.changed.connect(self.translate)
         self.translate_y.changed.connect(self.translate)
         self.translate_z.changed.connect(self.translate)
+        self.scale_xy.changed.connect(self.translate)
         self.save_affine_button.clicked.connect(self.save_starting_affine)
         
         
@@ -123,6 +141,7 @@ class ExampleQWidget(Container):
         # Load con_df
         con_path = os.path.join(self.denoised_dir, "all_neuron_contours.h5")
         self.con_df = pd.read_hdf(con_path)
+        self.con_df_copy = self.con_df.copy()
         self.plot_all_contours()
 
         # Load dff_df
@@ -141,6 +160,15 @@ class ExampleQWidget(Container):
             overview_file = [os.path.join(overview_dir, file) for file in os.listdir(overview_dir) if "overview" in file][0]
         
             self.overview_im  = da.rot90(da.rot90(imread(overview_file), axes = (1, 2)), axes = (1, 2))
+            self.overview_im = da.reshape(self.overview_im, (self.overview_im.shape[0], 1, *self.overview_im.shape[1:]))
+            overview_affine_path = os.path.join(overview_dir, "affine_map.npy")
+
+            if os.path.exists(overview_affine_path):
+                self.overview_affine = np.load(overview_affine_path)
+            else:
+                self.overview_affine = None
+
+
         except:
             print("No overview file")
             self.overview_im = None
@@ -157,6 +185,7 @@ class ExampleQWidget(Container):
 
         if os.path.exists(io_template_path):
             self.io_template =  imread(io_template_path)
+            self.io_template = self.io_template.reshape((self.io_template.shape[0], 1, *self.io_template.shape[1:]))
         else:
             self.io_template = None
 
@@ -176,6 +205,10 @@ class ExampleQWidget(Container):
                                     da.rot90(
                                     da.flip(imread(r"Z:\Pierce\Elavl3-H2BRFP\Elavl3-H2BRFP_rotated.tif"), 
                                             axis=0), axes = (1, 2)), axes = (1, 2))
+        
+        self.reference_brain = da.reshape(self.reference_brain, (self.reference_brain.shape[0], 1, *self.reference_brain.shape[1:]))
+        self.reference_grid2world = np.eye(4)
+
         # maybe need an affine map button to select whether images should be mapped to zbrain reference
         self.set_default_filters()
         self.update_menu_choices()
@@ -188,15 +221,15 @@ class ExampleQWidget(Container):
         if isinstance(self.im, (np.ndarray, da.core.Array)):
             print(self.im.shape)
             self.denoised_layer = self.viewer.add_image(np.zeros((self.im.shape[0], *self.im.shape[2:])), 
-                                                        name = "Denoised Recording", opacity = 0.5)
+                                                        name = "Denoised Recording", opacity = 0.5, colormap = "inferno")
 
         if isinstance(self.rois, (np.ndarray, list)):
             self.roi_layer = self.viewer.add_shapes(self.rois,shape_type = "polygon", edge_width=0.4,
-                                  edge_color='white', face_color='transparent', name = "ROIs")
+                                  edge_color='white', face_color='transparent', name = "ROIs", opacity = 0.3)
             self.roi_layer.events.highlight.connect(self.roi_selected)
 
         if isinstance(self.io_template, (np.ndarray, da.core.Array)):
-            self.template_layer = self.viewer.add_image(self.io_template, name = "IO Template", opacity = 0.5, visible = False)
+            self.template_layer = self.viewer.add_image(self.io_template, name = "IO Template", opacity = 0.5, visible = False, colormap = "magenta")
 
         if isinstance(self.overview_im, (np.ndarray, da.core.Array)):
             self.overview_im_layer = self.viewer.add_image(self.overview_im, name = "Overview", opacity = 0.5, visible = False)
@@ -204,10 +237,14 @@ class ExampleQWidget(Container):
         if isinstance(self.reference_brain, (np.ndarray, da.core.Array)):
             self.reference_brain_layer = self.viewer.add_image(self.reference_brain, name = "H2B:Elavl3", opacity = 0.5, visible = False)
 
-
+        # set registrataion options as layers
+        
+        self.channel_to_register_dropdown.choices = [layer.name for layer in self.viewer.layers]
+        self.channel_to_register_to_dropdown.choices  = [layer.name for layer in self.viewer.layers]
 
         #print(self.template_layer, self.denoised_layer)
         print(self.viewer.layers)
+        print(type(self.viewer.layers))
 
     def plot_all_contours(self): # slow
         
@@ -228,8 +265,8 @@ class ExampleQWidget(Container):
         
         z_index = [] 
         shapes= []
-        for cell in self.con_df.cell_id.sort_values().unique():
-            subset = self.con_df[self.con_df.cell_id == cell].dropna().copy()
+        for cell in self.con_df_copy.cell_id.sort_values().unique():
+            subset = self.con_df_copy[self.con_df_copy.cell_id == cell].dropna().copy()
             contours = subset[["z","cell_id", "y", "x"]]
 
             contours.cell_id = np.zeros(contours.shape[0])
@@ -420,7 +457,7 @@ class ExampleQWidget(Container):
             print("loading dask images")
             self.denoised_layer.data = self.im[:, self.first_vol:self.end_vol ].compute()
             self.denoised_layer.contrast_limits_range = (0, 255)
-            self.denoised_layer.contrast_limits = [0, 40]
+            self.denoised_layer.contrast_limits = [0, 25]
             #self.denoised_layer.reset_contrast_limits_range()
             #self.denoised_layer.reset_contrast_limits()
             
@@ -505,6 +542,22 @@ class ExampleQWidget(Container):
     def clear_plot(self):
         self.viewer1d.clear_canvas()
 
+    def apply_tranform(self, ref_grid2world, im_grid2world, affine, ref, im):
+    
+        
+        affine_map = AffineMap(affine,
+                               ref.shape, ref_grid2world,
+                               im.shape, im_grid2world)
+        
+        if self.gpu:
+            resampled = cp.asnumpy(affine_map.transform(cp.asarray((im/256).astype("int8")))) # why change in bit depth
+            
+            
+        else:
+            resampled = affine_map.transform(im)
+        
+        return resampled
+
     def translate(self, event):
         
         if self.moving_grid2world is not None:
@@ -512,20 +565,110 @@ class ExampleQWidget(Container):
             self.x = self.translate_x.value
             self.y = self.translate_y.value
             self.z = self.translate_z.value
+            self.scale = self.scale_xy.value
 
             self.grid_copy = np.eye(4)
+
+            # set translation of affine matrix
             self.grid_copy[2, -1] += self.x # x
             self.grid_copy[1, -1] += self.y # y
             self.grid_copy[0, -1] += self.z # z
+
+            # set scale of affine matrix
+            self.grid_copy[2, 2] = self.scale
+            self.grid_copy[1, 1] = self.scale
+
             
-            if len(self.overview_im.data.shape) > 2: # if not still empty array
-                self.template.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy, self.overview_im.data, self.template_orig)
+            #if len(self.channel_to_register.data.shape) > 2: # if not still empty array
+            if (self.moving_grid2world is not None) & (self.ref_grid2world is not None):
+                self.channel_to_register.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy,
+                                                    self.channel_to_register_to.data, self.channel_to_register.data)
                 
-            else:
-                self.template.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy, self.reference_brain.data, self.template_orig)
-            
+            #else:
+            #    self.template.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy, self.reference_brain.data, self.template_orig)
+
+    def reset_registered_channels(self):
+        # assign this function to a button to reset any affine mapping performed on channel
+        pass
+    
+    def update_registration_channels(self, event):
+
+        self.channel_to_register = [layer for layer in self.viewer.layers if layer.name == self.channel_to_register_dropdown.value][0]
+        self.channel_to_register_to = [layer for layer in self.viewer.layers if layer.name == self.channel_to_register_to_dropdown.value][0]
+
+
+        if self.channel_to_register_dropdown.value == "IO Template":
+            self.moving_grid2world = self.io_grid2world
+
+        elif self.channel_to_register_dropdown.value == "Overview":
+            self.moving_grid2world = self.overview_grid_to_world
+
+        else:
+            self.moving_grid2world = None
+
+        if self.channel_to_register_to_dropdown.value == "Overview":
+            self.ref_grid2world = self.overview_grid_to_world
+        
+        elif "elav" in self.channel_to_register_to_dropdown.value:
+            self.ref_grid2world = self.reference_grid2world
+
+        else:
+            self.ref_grid2world = None
+
+        print("Moving grid to world is {} and ref grid to world is {}".format(self.moving_grid2world, self.ref_grid2world))
+
+
     def save_starting_affine(self):
         #save affine transform
         filename = self.affine_name.value
         np.save(os.path.join(self.denoised_dir, filename), self.grid_copy)
+
+    def affine_map_all(self, event):
+        # check value
+        print("checkbox {}".format(event))
+        # check for io_affine.npy and affine_map.npy
+        # apply both to IO_template, denoised and contours
+        # apply affine_map to overview only
+
+        if event:
+
+            if (self.io_affine is not None) & (self.overview_affine is not None):
+                print("registering all")
+                io_to_overview = self.apply_transform(self.overview_grid_to_world, self.io_grid2world, self.io_affine, self.overview_im, self.denoised_layer.data)
+                self.denoised_layer.data = self.apply_transform(self.reference_grid2world, self.overview_grid_to_world, self.overview_affine, self.reference_brain, io_to_overview)
+
+                # map contours
+                self.transform_contours(self.io_affine, self.io_grid2world, self.overview_grid_to_world)
+                self.transform_contours(self.overview_affine, self.overview_grid_to_world, self.reference_grid2world)
+
+            if (self.io_affine is not None):
+                print("registering IO to overview")
+        else:
+            self.reset_affine()
+
+    def reset_affine(self):
+        # to reset 
+       
+        pass
+           
+    
+    
+
+
+    def transform_coordinates(self, coordinates, affine_transform, domain_transform, codomain_transform):
+        # in shape z, y, x, 1
+        new_coords = np.zeros(coordinates.shape)
+        for coord_idx, coord in enumerate(coordinates):
+
+            new_coord = np.dot(np.linalg.inv(codomain_transform), np.dot(affine_transform, np.dot(domain_transform, coord)))
+            new_coords[coord_idx] = new_coord
+
+        return new_coords
+
+    def transform_contours(self, affine, domain_grid2world, codomain_grid2world): 
+        
+        contours = self.con_df_copy.loc[:, ["z", "y", "x"]].to_numpy()
+        contour_coords = np.concatenate([contours, np.ones((contours.shape[0], 1))], axis= 1)
+        new_coords = self.transform_coordinates(contour_coords, affine, domain_grid2world, codomain_grid2world)
+        self.con_df_copy.loc[:, ["z", "y", "x"]] = new_coords[:, :3]
                
