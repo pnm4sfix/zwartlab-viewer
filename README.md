@@ -22,12 +22,25 @@ https://napari.org/stable/plugins/index.html
 -->
 
 ## Installation
+    conda create -n ZwartlabViewer python=3.10
+    
+    conda activate ZwartlabViewer
+
+    conda install -c conda-forge cupy-cuda117
+
+    conda install -c "nvidia/label/cuda-11.7.0" cuda
+
+    
 
 You can install `zwartlab-viewer` via [pip]:
 
+    pip install napari["all"]
+
     pip install zwartlab-viewer
 
+    pip install git+https://github.com/dipy/cudipy.git
 
+    
 
 To install latest development version :
 

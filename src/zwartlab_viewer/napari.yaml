@@ -2,12 +2,19 @@ name: zwartlab-viewer
 display_name: Zwartlab Viewer
 contributions:
   commands:
-    - id: zwartlab-viewer.make_qwidget
-      python_name: zwartlab_viewer._widget:ExampleQWidget
-      title: Make example QWidget
+    - id: zwartlab-viewer.make_imaging_widget
+      python_name: zwartlab_viewer._imaging_widget:ImagingWidget
+      title: Make imaging widget
+
+    - id: zwartlab-viewer.make_registration_widget
+      python_name: zwartlab_viewer._registration_widget:RegistrationWidget
+      title: Make registration widget
     
   widgets:
-    - command: zwartlab-viewer.make_qwidget
-      display_name: Example QWidget
+    - command: zwartlab-viewer.make_imaging_widget
+      display_name: Imaging
+    - command: zwartlab-viewer.make_registration_widget
+      display_name: Registration
     
     
+
