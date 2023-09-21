@@ -1,4 +1,4 @@
 {
   "SuppressConfigureTestFrameworkPrompt": "true",
-  "Interpreter": "CondaEnv|CondaEnv|neuroviewer"
+  "Interpreter": "CondaEnv|CondaEnv|ZwartlabViewer"
 }

@@ -9,7 +9,14 @@ contributions:
     - id: zwartlab-viewer.make_registration_widget
       python_name: zwartlab_viewer._registration_widget:RegistrationWidget
       title: Make registration widget
-    
+
+    - id: zwartlab-viewer.napari_get_reader
+      python_name: zwartlab_viewer._reader:napari_get_reader
+      title: Read czi, scanimage or imagej tiff and load with correct scale parameters in microns
+  readers:
+    - command: zwartlab-viewer.napari_get_reader
+      accepts_directories: false
+      filename_patterns: ["*.czi", "*.tif"]
   widgets:
     - command: zwartlab-viewer.make_imaging_widget
       display_name: Imaging

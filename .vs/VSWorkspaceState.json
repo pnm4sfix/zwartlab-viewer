@@ -1,9 +1,10 @@
 {
   "ExpandedNodes": [
     "",
+    "\\.napari-hub",
     "\\src",
     "\\src\\zwartlab_viewer"
   ],
-  "SelectedNode": "\\src\\zwartlab_viewer\\_widget.py",
+  "SelectedNode": "\\src\\zwartlab_viewer\\_imaging_widget.py",
   "PreviewInSolutionExplorer": false
 }

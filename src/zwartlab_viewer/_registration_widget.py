@@ -6,6 +6,7 @@ see: https://napari.org/stable/plugins/guides.html?#widgets
 
 Replace code below according to your needs.
 """
+from base64 import a85encode
 from typing import TYPE_CHECKING
 
 
@@ -26,25 +27,39 @@ import pandas as pd
 from dask_image.imread import imread
 import dask.dataframe as dd
 import dask.array as da
+import dask
 import numpy as np
 import cupy as cp
+from napari.layers import Image
+from scipy.ndimage import rotate
 if cp.cuda.Device():
-    
-    from cudipy.align.imaffine import AffineMap        
-else:
+    free, total =cp.cuda.Device().mem_info
+    from cupyx.scipy.ndimage import affine_transform
+    if free > 4e9:
+        from cudipy.align.imaffine import AffineMap  
         
+    else:
+        from dipy.align.imaffine import AffineMap
+        
+else:
+    from scipy.ndimage import affine_transform
     from dipy.align.imaffine import AffineMap
 
 if TYPE_CHECKING:
     import napari
+    
 
 
-class ImagingWidget(Container):
-    # your QWidget.__init__ can optionally request the napari viewer instance
-    # in one of two ways:
-    # 1. use a parameter called `napari_viewer`, as done here
-    # 2. use a type annotation of 'napari.viewer.Viewer' for any parameter
+class RegistrationWidget(Container):
+    
     # This should be the registration widget
+    # Show napari images in micron world coordinates
+    # Create zbrain tiff reader that loads zbrain images and stores microscopy metadata
+    # issue with high resolution image requiring rotation - implement basic cupy.ndimage or scipy image processing functions - or add rotation functions to affine matrix -issue would be that rotation would not be centered
+    # Get accurate scanimage micron coordinates
+    # Create a scanimage tiff reader plugin for napari
+    # Create a zbrain tiff reader plugin for napari that loads metadata in appropriate way
+
     
 
 
@@ -53,7 +68,14 @@ class ImagingWidget(Container):
         super().__init__()
 
         if cp.cuda.Device():
-            self.gpu = True
+            # check large enough gpu
+            free, total =cp.cuda.Device().mem_info
+
+            if free > 4e9:
+
+                self.gpu = True
+            else:
+                self.gpu = False
         else:
             self.gpu = False
 
@@ -64,35 +86,317 @@ class ImagingWidget(Container):
         registration_label = Label(name = "Registration", label = "Registration")
         # Add check box - grey out if self io_affine etc is None - if checkbox is ticked all images and contours will be transformed
         self.registration_checkbox = CheckBox(name = "Live registration enabled")
-        self.registration_checkbox.changed.connect(self.affine_map_all)
+        #self.registration_checkbox.changed.connect(self.affine_map_all)
 
         # Add dropdown to select appropriate channel for registration
         self.channel_to_register_dropdown = ComboBox(label='Channel to Register', choices = [], tooltip =  "Select channel to register")
         self.channel_to_register_to_dropdown = ComboBox(label='Channel to Register to', choices = [], tooltip =  "Select channel to register")
 
-        self.channel_to_register_dropdown.changed.connect(self.update_registration_channels)
-        self.channel_to_register_to_dropdown.changed.connect(self.update_registration_channels)
+        # populate the dropdown with the channels in the viewer
+        self.update_channel_menu(None)
+
+        #self.channel_to_register_dropdown.changed.connect(self.update_registration_channels)
+        #self.channel_to_register_to_dropdown.changed.connect(self.update_registration_channels)
 
 
-        self.translate_x = FloatSpinBox(label = "translate x", tooltip = "change x translation", min = -500, max = 500, value = 0)
-        self.translate_y = FloatSpinBox(label = "translate y", tooltip = "change y translation", min = -500, max = 500, value = 0)
-        self.translate_z = FloatSpinBox(label = "translate z", tooltip = "change z translation", min = -500, max = 500, value = 0)
-        self.scale_xy = FloatSpinBox(label = "scale xy", tooltip = "change xy scale", min = -500, max = 500, value = 1)
-        self.affine_name = TextEdit(label = "affine filename", value = "affine.npy")
-        self.save_affine_button = PushButton(label = "save affine")
+        self.translate_x = FloatSpinBox(label = "translate x", tooltip = "change x translation", min = -1000, max = 1000, value = 0)
+        self.translate_y = FloatSpinBox(label = "translate y", tooltip = "change y translation", min = -1000, max = 1000, value = 0)
+        self.translate_z = FloatSpinBox(label = "translate z", tooltip = "change z translation", min = -1000, max = 1000, value = 0)
+        self.scale_xy = FloatSpinBox(label = "scale xy", tooltip = "change xy scale", min = -1000, max = 1000, value = 1)
+        self.rotate_x = FloatSpinBox(label = "rotate x", tooltip = "change x rotation", min = -180, max = 180, value = 0)
+        self.rotate_y = FloatSpinBox(label = "rotate y", tooltip = "change y rotation", min = -180, max = 180, value = 0)
+        self.rotate_z = FloatSpinBox(label = "rotate z", tooltip = "change z rotation", min = -180, max = 180, value = 0)
+        self.rotate90_button = PushButton(label = "Rotate 90")
+        #self.affine_name = TextEdit(label = "affine filename", value = "affine.npy")
+        self.create_registered = PushButton(label = "Affine Map")
         
-        self.translate_x.changed.connect(self.translate)
-        self.translate_y.changed.connect(self.translate)
-        self.translate_z.changed.connect(self.translate)
-        self.scale_xy.changed.connect(self.translate)
-        self.save_affine_button.clicked.connect(self.save_starting_affine)
+        self.translate_x.changed.connect(self.update_affine)
+        self.translate_y.changed.connect(self.update_affine)
+        self.translate_z.changed.connect(self.update_affine)
+        self.scale_xy.changed.connect(self.update_affine)
+        self.rotate_x.changed.connect(self.update_affine)
+        self.rotate_y.changed.connect(self.update_affine)
+        self.rotate_z.changed.connect(self.update_affine)
+        self.rotate90_button.changed.connect(self.rotate90)
+
+
+        self.create_registered.clicked.connect(self.update_registration_channels)
+        self.viewer.layers.events.changed.connect(self.update_channel_menu)
+        self.viewer.layers.events.inserted.connect(self.update_channel_menu)
+
+        # connect viewer layers events renamed to update channel menu
+        #self.viewer.layers.events.renamed.connect(self.update_channel_menu)    
+
         
         
         self.extend([ registration_label, self.registration_checkbox, self.channel_to_register_dropdown, self.channel_to_register_to_dropdown,
-                    self.translate_x, self.translate_y, self.translate_z, 
-                    self.affine_name, self.save_affine_button])
+                    self.translate_x, self.translate_y, self.translate_z, self.scale_xy, self.rotate90_button, self.rotate_x, self.rotate_y, self.rotate_z, self.create_registered])
+                    
+    def rotate90(self):
+        # use np.rot to rotate the image in the registered channel
+        self.viewer.layers[self.channel_to_register_dropdown.value].data = rotate(self.viewer.layers[self.channel_to_register_dropdown.value].data, 90, axes = (3, 2), reshape = False)
+
+    
+    def update_channel_menu(self, event):
+        print("layers changed")
+        # update the channel to register dropdown and channel to register to dropdown with the image layers in the viewer
+        self.channel_to_register_dropdown.choices = [layer.name for layer in self.viewer.layers if isinstance(layer, Image)]
+        self.channel_to_register_to_dropdown.choices = [layer.name for layer in self.viewer.layers if isinstance(layer, Image)]
+
+        # connect all layers to name change
+        [layer.events.name.connect(self.update_channel_menu) for layer in self.viewer.layers if isinstance(layer, Image)]
+
+    def update_affine(self, event):
+        self.x = self.translate_x.value
+        self.y = self.translate_y.value
+        self.z = self.translate_z.value
+        self.scale = self.scale_xy.value
+        
+
+        #self.grid_copy = np.eye(4) # assume 3 dims ZYX
+
+        
+        #self.grid_copy[2, -1] += self.x # x
+        #self.grid_copy[1, -1] += self.y # y
+        #self.grid_copy[0, -1] += self.z # z
+        #t, z, y, x, 1
+
+        
+        #self.grid_copy[2, 2] = self.scale
+        #self.grid_copy[1, 1] = self.scale
+        # set translation of affine matrix
+        channel_to_apply_affine = self.viewer.layers[self.channel_to_register_dropdown.value]
+        registered_affine = np.array(channel_to_apply_affine.affine)
+        registered_affine[1, -1] = self.z
+        registered_affine[2, -1] = self.y
+        registered_affine[3, -1] = self.x 
+
+        # set scale of affine matrix
+        registered_affine[2, 2] = self.scale
+        registered_affine[3, 3] = self.scale
+
+        #set rotation of affine matrix
+
+
+        # if rotation could add a center shift, rotate then unshift?
+        angle = np.radians(self.rotate_z.value)
+        if angle > 0:
+
+            # create a translation matrix
+            move_to_center = np.eye(registered_affine.shape[0])
+            move_to_center[3, -1] -= channel_to_apply_affine.data.shape[1] / 2
+            move_to_center[4, -1] -= channel_to_apply_affine.data.shape[2] / 2
+
+            # create a rotation matrix
+            rotate = np.eye(registered_affine.shape[0])
+            rotate[4, 4] = np.cos(angle)
+            rotate[3, 3] = np.cos(angle)
+            rotate[3, 4] = np.sin(angle)
+            rotate[4, 3] = -np.sin(angle)
+            
+            # np dot registered_affine_copy with a move back matrix
+            move_back = np.eye(registered_affine.shape[0])
+            move_back[3, -1] += channel_to_apply_affine.data.shape[1] / 2
+            move_back[4, -1] += channel_to_apply_affine.data.shape[2] / 2
+            
+
+            r = np.dot(move_to_center, rotate)
+            b = np.dot(r, move_back)
+            registered_affine = np.dot(registered_affine, b)
+
+
+        channel_to_apply_affine.affine = registered_affine
+
+    def download_extract_zbrain(self, marker):
+
+        
+        import requests, zipfile, io
+
+        if marker == "elavl3-H2BRFP":
+            zip_file_url = r"https://zebrafishmodel.zib.de/fishexplorer/lm/download/datasets/Elavl3-H2BRFP.zip?AWSAccessKeyId=workerUser&Expires=1688478515&Signature=glSbO8vnwZKHb%2BUhYY9FddHvFiA%3D"
+        r = requests.get(zip_file_url)
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        z.extractall("/downloads")
+    
+    def apply_tranform(self, ref_grid2world, im_grid2world, affine, ref, im):
         
         
+        affine_map = AffineMap(affine,
+                               ref.shape, ref_grid2world,
+                               im.shape, im_grid2world)
+        
+        if self.gpu:
+            resampled = cp.asnumpy(affine_map.transform(cp.asarray((im/256).astype("int8")))) # why change in bit depth
+            
+            
+        else:
+            resampled = affine_map.transform(im)
+        
+        return resampled
+
+    def affine_map_moving2ref(self, event):
+        print("affine mapping")
+        if self.moving_grid2world is not None:
+            # manually estimate translation
+
+
+            
+            
+            self.grid_copy = np.eye(4)
+            # get dimensions of each channel and only select the last 3 as dipy only takes dims 3
+            if len(self.channel_to_register.data.shape) == 5:
+                #maybe loop through each dim greater than 3 and do registration
+                for c in range(self.channel_to_register.data.shape[0]):
+                    for t in range(self.channel_to_register.data.shape[1]):
+                        self.registered_channel.data[c, t, :, :, :] = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy,
+                                                                            self.channel_to_register_to.data[c, t, :, :, :], self.channel_to_register.data[c, t, :, :, :])
+
+            elif len(self.channel_to_register.data.shape) == 4:
+                #maybe loop through each dim greater than 3 and do registration
+                
+                for t in range(self.channel_to_register.data.shape[0]):
+                    self.registered_channel.data[t, :, :, :] = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy,
+                                                                        self.channel_to_register_to.data[t, :, :, :], self.channel_to_register.data[t, :, :, :])
+
+            elif len(self.channel_to_register.data.shape) == 3:
+                
+                self.registered_channel.data[ :, :, :] = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy,
+                                                                            self.channel_to_register_to.data[:, :, :], self.channel_to_register.data[ :, :, :])
+
+            
+            #if len(self.channel_to_register.data.shape) > 2: # if not still empty array
+            #if (self.moving_grid2world is not None) & (self.ref_grid2world is not None):
+            #    self.registered_channel.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy,
+            #                                        self.channel_to_register_to.data, self.channel_to_register.data)
+                
+            #else:
+            #    self.template.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy, self.reference_brain.data, self.template_orig)
+
+    def reset_registered_channels(self):
+        # assign this function to a button to reset any affine mapping performed on channel
+        pass
+
+    def convert_scale_to_grid(self, scale: np.array) -> np.array:
+        
+        """Parameters:
+            scale: np.array(z, y, x) - stored in image layer metadata
+
+           Returns:
+            affine: np.array(5, 5) where row order is z, y, x, 1
+            """
+        affine = np.eye(4)
+        affine[0, 0] = scale[0]
+        affine[1, 1] = scale[1]
+        affine[2, 2] = scale[2]
+        
+
+        return affine
+
+
+    
+    def update_registration_channels(self, event):
+
+        assert len(self.viewer.layers) >= 2
+
+        self.channel_to_register = [layer for layer in self.viewer.layers if layer.name == self.channel_to_register_dropdown.value][0]
+        self.channel_to_register_to = [layer for layer in self.viewer.layers if layer.name == self.channel_to_register_to_dropdown.value][0]
+        
+
+        # grid2world should be able to be created from layer metadata
+        # assumes last 3 dims are z, y, x
+        self.moving_grid2world = self.convert_scale_to_grid(self.channel_to_register.scale[-3:])
+        self.ref_grid2world = self.convert_scale_to_grid(self.channel_to_register_to.scale[-3:])
+
+        # affine transform grid2world for moving and ref using the affine associated with each channel
+        self.moving_grid2world = np.matmul(self.moving_grid2world, self.channel_to_register.affine)
+        self.ref_grid2world = np.matmul(self.ref_grid2world, self.channel_to_register_to.affine)
+        
+        print("Moving grid to world is {} and ref grid to world is {}".format(self.moving_grid2world,
+                                                                             self.ref_grid2world))
+
+        # check new channel name doesn't already exist
+        new_channel_name = self.channel_to_register.name+"-registered"
+        if self.channel_to_register.name+"-registered" not in [layer.name for
+                                                          layer in self.viewer.layers]:
+            # create new image layer to store registered channel 
+            self.registered_channel = self.viewer.add_image(data = np.zeros(
+                                            self.channel_to_register_to.data.shape, dtype = self.channel_to_register_to.dtype),
+                                           name = self.channel_to_register.name+"-registered", scale = self.channel_to_register_to.scale,
+                                           translate = self.channel_to_register_to.translate, opacity = 0.5)
+        else:
+            self.registered_channel = [layer for layer in self.viewer.layers 
+                                       if layer.name == new_channel_name][0]
+        self.registered_channel.affine = np.array(self.registered_channel.affine)
+        self.affine_map_moving2ref(None)
+
+
+    #def save_starting_affine(self):
+    #    #save affine transform
+    #    filename = self.affine_name.value
+    #    np.save(os.path.join(self.denoised_dir, filename), self.grid_copy)
+
+    """def affine_map_all(self, event):
+        # check value
+        print("checkbox {}".format(event))
+        # check for io_affine.npy and affine_map.npy
+        # apply both to IO_template, denoised and contours
+        # apply affine_map to overview only
+
+        if event:
+
+            if (self.io_affine is not None) & (self.overview_affine is not None):
+                print("registering all")
+                io_to_overview = self.apply_transform(self.overview_grid_to_world, self.io_grid2world, self.io_affine, self.overview_im, self.denoised_layer.data)
+                self.denoised_layer.data = self.apply_transform(self.reference_grid2world, self.overview_grid_to_world, self.overview_affine, self.reference_brain, io_to_overview)
+
+                # map contours
+                self.transform_contours(self.io_affine, self.io_grid2world, self.overview_grid_to_world)
+                self.transform_contours(self.overview_affine, self.overview_grid_to_world, self.reference_grid2world)
+
+            if (self.io_affine is not None):
+                print("registering IO to overview")
+        else:
+            self.reset_affine()"""
+
+    def reset_affine(self):
+        # to reset 
+       
+        pass
+           
+    
+    
+
+
+    def transform_coordinates(self, coordinates, affine_transform, domain_transform, codomain_transform):
+        # in shape z, y, x, 1
+        new_coords = np.zeros(coordinates.shape)
+        for coord_idx, coord in enumerate(coordinates):
+
+            new_coord = np.dot(np.linalg.inv(codomain_transform), np.dot(affine_transform, np.dot(domain_transform, coord)))
+            new_coords[coord_idx] = new_coord
+
+        return new_coords
+
+    def transform_contours(self, affine, domain_grid2world, codomain_grid2world): 
+        
+        contours = self.con_df_copy.loc[:, ["z", "y", "x"]].to_numpy()
+        contour_coords = np.concatenate([contours, np.ones((contours.shape[0], 1))], axis= 1)
+        new_coords = self.transform_coordinates(contour_coords, affine, domain_grid2world, codomain_grid2world)
+        self.con_df_copy.loc[:, ["z", "y", "x"]] = new_coords[:, :3]
+
+    @dask.delayed
+    def dask_affine_transform(im, affine, arraytype = "numpy"):
+        
+        if arraytype == "numpy":
+            # use scipy.ndimage affin transform
+            return affine_transform(im, affine)
+        
+        elif arraytype ==  "cupy":
+            return affine_transform(im, cp.asarray(affine))
+               
+        
+        
+        """LEGACY
         # Load fluorescence data - returns self.im
         self.lazy_load_images()
 
@@ -386,7 +690,7 @@ class ImagingWidget(Container):
         #self.im = da.stack(da_ims)
         
         print("loading finished")
-
+        
    
 
 
@@ -394,7 +698,7 @@ class ImagingWidget(Container):
 
     #### Exploration functions    #############################################
     def load_image(self):
-        """Load image"""
+        #"Load image"
         if self.volume_subset.shape[0] > 0:
             print("loading dask images")
             self.denoised_layer.data = self.im[:, self.first_vol:self.end_vol ].compute()
@@ -484,133 +788,5 @@ class ImagingWidget(Container):
     def clear_plot(self):
         self.viewer1d.clear_canvas()
 
-    def apply_tranform(self, ref_grid2world, im_grid2world, affine, ref, im):
-    
-        
-        affine_map = AffineMap(affine,
-                               ref.shape, ref_grid2world,
-                               im.shape, im_grid2world)
-        
-        if self.gpu:
-            resampled = cp.asnumpy(affine_map.transform(cp.asarray((im/256).astype("int8")))) # why change in bit depth
-            
-            
-        else:
-            resampled = affine_map.transform(im)
-        
-        return resampled
+        """
 
-    def translate(self, event):
-        
-        if self.moving_grid2world is not None:
-            # manually estimate translation
-            self.x = self.translate_x.value
-            self.y = self.translate_y.value
-            self.z = self.translate_z.value
-            self.scale = self.scale_xy.value
-
-            self.grid_copy = np.eye(4)
-
-            # set translation of affine matrix
-            self.grid_copy[2, -1] += self.x # x
-            self.grid_copy[1, -1] += self.y # y
-            self.grid_copy[0, -1] += self.z # z
-
-            # set scale of affine matrix
-            self.grid_copy[2, 2] = self.scale
-            self.grid_copy[1, 1] = self.scale
-
-            
-            #if len(self.channel_to_register.data.shape) > 2: # if not still empty array
-            if (self.moving_grid2world is not None) & (self.ref_grid2world is not None):
-                self.channel_to_register.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy,
-                                                    self.channel_to_register_to.data, self.channel_to_register.data)
-                
-            #else:
-            #    self.template.data = self.apply_tranform(self.ref_grid2world, self.moving_grid2world, self.grid_copy, self.reference_brain.data, self.template_orig)
-
-    def reset_registered_channels(self):
-        # assign this function to a button to reset any affine mapping performed on channel
-        pass
-    
-    def update_registration_channels(self, event):
-
-        self.channel_to_register = [layer for layer in self.viewer.layers if layer.name == self.channel_to_register_dropdown.value][0]
-        self.channel_to_register_to = [layer for layer in self.viewer.layers if layer.name == self.channel_to_register_to_dropdown.value][0]
-
-
-        if self.channel_to_register_dropdown.value == "IO Template":
-            self.moving_grid2world = self.io_grid2world
-
-        elif self.channel_to_register_dropdown.value == "Overview":
-            self.moving_grid2world = self.overview_grid_to_world
-
-        else:
-            self.moving_grid2world = None
-
-        if self.channel_to_register_to_dropdown.value == "Overview":
-            self.ref_grid2world = self.overview_grid_to_world
-        
-        elif "elav" in self.channel_to_register_to_dropdown.value:
-            self.ref_grid2world = self.reference_grid2world
-
-        else:
-            self.ref_grid2world = None
-
-        print("Moving grid to world is {} and ref grid to world is {}".format(self.moving_grid2world, self.ref_grid2world))
-
-
-    def save_starting_affine(self):
-        #save affine transform
-        filename = self.affine_name.value
-        np.save(os.path.join(self.denoised_dir, filename), self.grid_copy)
-
-    def affine_map_all(self, event):
-        # check value
-        print("checkbox {}".format(event))
-        # check for io_affine.npy and affine_map.npy
-        # apply both to IO_template, denoised and contours
-        # apply affine_map to overview only
-
-        if event:
-
-            if (self.io_affine is not None) & (self.overview_affine is not None):
-                print("registering all")
-                io_to_overview = self.apply_transform(self.overview_grid_to_world, self.io_grid2world, self.io_affine, self.overview_im, self.denoised_layer.data)
-                self.denoised_layer.data = self.apply_transform(self.reference_grid2world, self.overview_grid_to_world, self.overview_affine, self.reference_brain, io_to_overview)
-
-                # map contours
-                self.transform_contours(self.io_affine, self.io_grid2world, self.overview_grid_to_world)
-                self.transform_contours(self.overview_affine, self.overview_grid_to_world, self.reference_grid2world)
-
-            if (self.io_affine is not None):
-                print("registering IO to overview")
-        else:
-            self.reset_affine()
-
-    def reset_affine(self):
-        # to reset 
-       
-        pass
-           
-    
-    
-
-
-    def transform_coordinates(self, coordinates, affine_transform, domain_transform, codomain_transform):
-        # in shape z, y, x, 1
-        new_coords = np.zeros(coordinates.shape)
-        for coord_idx, coord in enumerate(coordinates):
-
-            new_coord = np.dot(np.linalg.inv(codomain_transform), np.dot(affine_transform, np.dot(domain_transform, coord)))
-            new_coords[coord_idx] = new_coord
-
-        return new_coords
-
-    def transform_contours(self, affine, domain_grid2world, codomain_grid2world): 
-        
-        contours = self.con_df_copy.loc[:, ["z", "y", "x"]].to_numpy()
-        contour_coords = np.concatenate([contours, np.ones((contours.shape[0], 1))], axis= 1)
-        new_coords = self.transform_coordinates(contour_coords, affine, domain_grid2world, codomain_grid2world)
-        self.con_df_copy.loc[:, ["z", "y", "x"]] = new_coords[:, :3]
-               

@@ -672,3 +672,7 @@ class ImagingWidget(Container):
         new_coords = self.transform_coordinates(contour_coords, affine, domain_grid2world, codomain_grid2world)
         self.con_df_copy.loc[:, ["z", "y", "x"]] = new_coords[:, :3]
                
+
+
+        
+
