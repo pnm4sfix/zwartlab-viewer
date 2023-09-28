@@ -10,18 +10,43 @@ contributions:
       python_name: zwartlab_viewer._registration_widget:RegistrationWidget
       title: Make registration widget
 
+    - id: zwartlab-viewer.make_caiman_widget
+      python_name: zwartlab_viewer._caiman_widget:CaimanWidget
+      title: Make caiman widget
+
+    - id: zwartlab-viewer.make_preprocess_widget
+      python_name: zwartlab_viewer._preprocess_widget:PreprocessWidget
+      title: Make preprocess widget
+
+    - id: zwartlab-viewer.make_stimulus_widget
+      python_name: zwartlab_viewer._stimulus_widget:StimulusWidget
+      title: Make stimulus widget
+
+    - id: zwartlab-viewer.make_decomposition_widget
+      python_name: zwartlab_viewer._decomposition_widget:DecompositionWidget
+      title: Make decomposition widget
+
     - id: zwartlab-viewer.napari_get_reader
       python_name: zwartlab_viewer._reader:napari_get_reader
       title: Read czi, scanimage or imagej tiff and load with correct scale parameters in microns
+
   readers:
     - command: zwartlab-viewer.napari_get_reader
       accepts_directories: false
-      filename_patterns: ["*.czi", "*.tif"]
+      filename_patterns: ["*.czi", "*.tif", "*.hdf5", "*.mmap"]
   widgets:
     - command: zwartlab-viewer.make_imaging_widget
       display_name: Imaging
     - command: zwartlab-viewer.make_registration_widget
       display_name: Registration
+    - command: zwartlab-viewer.make_caiman_widget
+      display_name: Caiman
+    - command: zwartlab-viewer.make_preprocess_widget
+      display_name: Preprocess
+    - command: zwartlab-viewer.make_stimulus_widget
+      display_name: Stimulus
+    - command: zwartlab-viewer.make_decomposition_widget
+      display_name: Decomposition
     
     
 

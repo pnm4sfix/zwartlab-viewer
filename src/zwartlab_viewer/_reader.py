@@ -9,6 +9,7 @@ import os
 import re
 import warnings
 from pathlib import Path
+from cupy import broadcast_arrays
 import numpy as np
 import dask
 import dask.array as da
@@ -20,6 +21,8 @@ from ScanImageTiffReader import ScanImageTiffReader
 import json
 import numbers
 from tifffile import natural_sorted
+import caiman as cm
+from caiman.utils.visualization import get_contours
 
 try: 
     import cupy as cp
@@ -31,17 +34,32 @@ except:
     device = "cpu"
     
 
+try:
+    print("Starting caiman cluster")
+    if 'dview' in locals():
+        cm.stop_server(dview=dview)
+    c, dview, n_processes = cm.cluster.setup_cluster(
+        backend='local', n_processes=None, single_thread=False)
+except:
+    pass
+    
+
 def napari_get_reader(path):
-    path = os.path.abspath(path)
+    #path = os.path.abspath(path)
+    if not isinstance(path, list):
+        path = [path]    
     print("Path for napari reader is {}".format(path))
     # check if path is tif, check if tif was scanimage acquired
-    if path.endswith(".tif"):
+    if path[0].endswith(".tif"):
         # return tif reader
         return tif_reader
 
     # check if path is czi and return czi reader
-    elif path.endswith(".czi"):
+    elif path[0].endswith(".czi"):
         return czi_reader
+    
+    elif (path[0].endswith(".hdf5")) | (path[0].endswith(".mmap")):
+        return caiman_reader
 
 
 
@@ -186,15 +204,19 @@ def scanimage_reader(paths, lazy= True, device = "cpu"):
             
         metadata = scanimage_file.metadata()
         main_metadata, roi_metadata = parse_scanimage_metadata(metadata)
-        z, y, x = get_scanimage_resolution(main_metadata, roi_metadata)
-        numSlices = get_Z(main_metadata)
-        C = get_numchannels(main_metadata)
         obj_res = get_objective_resolution(main_metadata)
-        print("objective resolution was {}".format(obj_res))
-
         if obj_res == 15: # maybe bemore specific
             correction_factor = 4.62866667
-            x, y = x*correction_factor, y * correction_factor
+            #x, y = x*correction_factor, y * correction_factor
+            z, y, x = get_scanimage_resolution(main_metadata, roi_metadata, correction_factor)
+        else:
+            z, y, x = get_scanimage_resolution(main_metadata, roi_metadata)
+        numSlices = get_Z(main_metadata)
+        C = get_numchannels(main_metadata)
+        
+        print("objective resolution was {}".format(obj_res))
+
+        
             #pass # apply correction to y and x
         
         nframes, height, width = im.shape
@@ -424,6 +446,216 @@ def _map_read_frame(x, multiple_files, block_info=None, **kwargs):
 def _read_frame(fn, i, *, arrayfunc=np.asanyarray):
     with ScanImageTiffReader(fn) as imgs:
         return arrayfunc(imgs.data(i[0], i[1]))
+    
+def read_cnm_data(cnms):
+    print("Reading cnm data")
+    # get length of cnms
+    layer_data = []
+
+    T = cnms[0].estimates.C.shape[-1]
+    Z = len(cnms)
+    C = 1
+    Y = cnms[0].dims[0]
+    X = cnms[0].dims[1]
+    
+    # get num blocks frmo blocksize
+    blocksize = 100
+    nblocks = int(np.ceil(T/blocksize))
+
+    blocks = [(n*blocksize, (n+1) * blocksize) for n in range(nblocks)]
+    
+    # get denoised dask array in TZCYX format
+    im = da.concatenate([da.stack([da.from_delayed(reconstruct_cnm(cnm, start, end), shape = (blocksize, 1, cnm.dims[0], cnm.dims[1]), dtype = np.float64) for cnm in cnms], axis=1) for start, end in blocks], axis=0)
+
+    # add extra shapes layer here for good components and bad components - make dask to extend in all dimensions lazily
+    shape_layers = add_contour_layers(cnms)
+    
+    scale = (1, 1, 1, 1, 1)
+            
+        
+    if type(im) == dask.array.core.Array:
+        # use first 100 for speed
+        in_mem_im_sub = im[:100].compute()
+        if type(in_mem_im_sub) != np.ndarray:
+            in_mem_im_sub = cp.asnumpy(in_mem_im_sub)
+        contrast_limits = (np.percentile(in_mem_im_sub, 10), np.percentile(in_mem_im_sub, 95))
+           
+    else:
+        contrast_limits = (np.percentile(im, 10), np.percentile(im, 95))
+
+    print("contrast limit is {}".format(contrast_limits))
+
+    metadata = {
+        "name": "image",
+        "scale": scale,
+        "contrast_limits": contrast_limits,
+        "opacity": 0.5
+    }
+    
+    layer_data.append((im, metadata, "image"))
+    layer_data.extend(shape_layers)
+
+    return layer_data
+
+def read_mmap_data(mmaps):
+    layer_data = []
+    # get shape from mmap file - format is Yr, dims, T
+    T = mmaps[0][2]
+    Z = len(mmaps)
+    C = 1
+    Y = mmaps[0][1][0]
+    X = mmaps[0][1][1]
+
+    dims = (Y, X)
+        
+    
+    # get num blocks frmo blocksize
+    blocksize = 100
+    nblocks = int(np.ceil(T/blocksize))
+
+    blocks = [(n*blocksize, (n+1) * blocksize) for n in range(nblocks)]
+    
+    # get denoised dask array in TZCYX format
+    im = da.concatenate([da.stack([da.from_delayed(reconstruct_mmap(mmap[0], dims, T, start, end), shape = (blocksize, 1, dims[0], dims[1]), dtype = np.float64) for mmap in mmaps], axis=1) for start, end in blocks], axis=0)
+
+    scale = (1, 1, 1, 1, 1)
+            
+        
+    if type(im) == dask.array.core.Array:
+        # use first 100 for speed
+        in_mem_im_sub = im[:100].compute()
+        if type(in_mem_im_sub) != np.ndarray:
+            in_mem_im_sub = cp.asnumpy(in_mem_im_sub)
+        contrast_limits = (np.percentile(in_mem_im_sub, 10), np.percentile(in_mem_im_sub, 95))
+           
+    else:
+        contrast_limits = (np.percentile(im, 10), np.percentile(im, 95))
+
+    print("contrast limit is {}".format(contrast_limits))
+
+    metadata = {
+        "name": "image",
+        "scale": scale,
+        "contrast_limits": contrast_limits,
+        "opacity": 0.5
+    }
+        
+    layer_data.append((im, metadata, "image"))
+    return layer_data
+
+
+def caiman_reader(paths, lazy= True, device = "cpu"):
+    # might be worth adding dask array for shape layer for good components and bad components
+
+    print("Paths to caiman reader are {}".format(paths))
+    layer_data = []
+    if not isinstance(paths, list):
+        paths = [paths]    
+    # path[0]  endswith
+    if paths[0].endswith(".hdf5"):
+        print("Loading hdf5 caiman file")
+        cnms = []
+        for fname in natural_sorted(paths):
+            print("Loading {}".format(fname))
+            cnms.append(cm.source_extraction.cnmf.cnmf.load_CNMF(fname))
+
+        cnm_layers = read_cnm_data(cnms)
+        layer_data.extend(cnm_layers)
+        
+
+    elif paths[0].endswith(".mmap"):
+        print("Loading mmap caiman file")
+        mmaps = []
+        for fname in natural_sorted(paths):
+            print("Loading {}".format(fname))
+            mmaps.append(cm.load_memmap(fname))
+            
+        mmap_layers = read_mmap_data(mmaps)
+        layer_data.extend(mmap_layers)
+        
+
+    return layer_data
+
+@dask.delayed
+def reconstruct_cnm(cnm, start, end):
+    # this will index error if end > than C.shape[1]
+    return (cnm.estimates.A.dot(cnm.estimates.C[:, start:end]) + \
+                        cnm.estimates.b.dot(cnm.estimates.f[:, start:end])).reshape((cnm.dims[0], cnm.dims[1]) + (-1,), order='F').transpose([2, 0, 1]).reshape(-1, 1,  cnm.dims[0], cnm.dims[1])
+@dask.delayed
+def reconstruct_mmap(mmap, dims, T, start, end):
+    if end > T:
+        end = -1
+        # pad
+        pad = np.zeros((T-end, dims[0], dims[1], end-start))
+    return np.reshape(mmap.T[start:end], [int(end-start)] + list(dims), order='F').reshape(-1, 1, dims[0], dims[1]) #TZCYX
+    
+        
+
+def get_contour_data(cnm, cnm_idx):
+    
+    contours = get_contours(cnm.estimates.A, (cnm.dims[0], cnm.dims[1]), thr=0.9)
+    # check previous usage
+    good_shapes= []
+    bad_shapes = []
+    for ncon, contour in enumerate(contours):
+        con = np.flip(contour["coordinates"], axis=1) # to get to (point, (y, x))
+        z_levels = np.expand_dims(np.repeat(cnm_idx, con.shape[0]), 0).T
+        #t_levels = np.zeros((con.shape[0], 1))
+        #t_levels[:] = is there a way to have contours show every time
+        c_levels = np.zeros((con.shape[0], 1))
+        shape = np.concatenate([z_levels, c_levels, con], axis=1)
+        #shape = np.round_(shape, 2)
+        nan_filter = np.isnan(shape).any(axis=1)
+        shape = shape[~nan_filter]
+
+        #remove duplicates
+        _, unique_index = np.unique(shape, axis=0, return_index=True)
+        sorted_index = np.sort(unique_index)
+        shape = shape[sorted_index]
+        
+        if ncon in cnm.estimates.idx_components:
+            good_shapes.append(shape)
+        elif ncon in cnm.estimates.idx_components_bad:
+            bad_shapes.append(shape)
+        
+    #viewer.add_shapes(shapes,shape_type = "polygon", edge_width=0.4,
+    #                              edge_color='white', face_color='transparent', name = "ROIs", opacity = 0.3)
+    
+    
+    
+    return good_shapes, bad_shapes
+
+def add_contour_layers(cnms):
+    layer_data = []
+    good_shapes_all_z = []
+    bad_shapes_all_z = []
+    
+    for cnm_idx, cnm in enumerate(cnms):
+        good_shapes, bad_shapes = get_contour_data(cnm, cnm_idx)
+        good_shapes_all_z.extend(good_shapes)
+        bad_shapes_all_z.extend(bad_shapes)
+        
+    good_metadata = {
+        "name": "good components",
+        "shape_type" : "polygon",
+        "edge_width" : 0.4,
+        "edge_color" : 'white',
+        "face_color" : 'transparent',
+        "opacity": 0.3
+    }
+    
+    bad_metadata = good_metadata.copy()
+    bad_metadata["edge_color"] = "red"
+    bad_metadata["name"] = "bad components"
+
+    layer_data.append((good_shapes_all_z, good_metadata, "shapes"))    
+    layer_data.append((bad_shapes_all_z, bad_metadata, "shapes"))
+    
+    return layer_data
+# add scan image z, x, y position
+# create reader for memmap files
+# add delayed reader of contours
+
 
 
 

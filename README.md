@@ -26,9 +26,9 @@ https://napari.org/stable/plugins/index.html
     
     conda activate ZwartlabViewer
 
-    conda install -c conda-forge cupy-cuda117
-
     conda install -c "nvidia/label/cuda-11.7.0" cuda
+
+    conda install -c conda-forge cupy
 
     
 
@@ -39,6 +39,8 @@ You can install `zwartlab-viewer` via [pip]:
     pip install zwartlab-viewer
 
     pip install git+https://github.com/dipy/cudipy.git
+
+    pip install git+https://github.com/lukasz-migas/napari-plot.git
 
     
 
