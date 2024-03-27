@@ -48,7 +48,9 @@ else:
 if TYPE_CHECKING:
     import napari
     
-
+### To Do 
+### Fix rotation
+### Add Dipy functions 
 
 class RegistrationWidget(Container):
     
@@ -107,6 +109,10 @@ class RegistrationWidget(Container):
         self.rotate_y = FloatSpinBox(label = "rotate y", tooltip = "change y rotation", min = -180, max = 180, value = 0)
         self.rotate_z = FloatSpinBox(label = "rotate z", tooltip = "change z rotation", min = -180, max = 180, value = 0)
         self.rotate90_button = PushButton(label = "Rotate 90")
+        
+        # add button for numpy flip along z axis
+        self.flip_z_button = PushButton(label = "Flip Z")
+            
         #self.affine_name = TextEdit(label = "affine filename", value = "affine.npy")
         self.create_registered = PushButton(label = "Affine Map")
         
@@ -118,6 +124,7 @@ class RegistrationWidget(Container):
         self.rotate_y.changed.connect(self.update_affine)
         self.rotate_z.changed.connect(self.update_affine)
         self.rotate90_button.changed.connect(self.rotate90)
+        self.flip_z_button.changed.connect(self.flip_z)
 
 
         self.create_registered.clicked.connect(self.update_registration_channels)
@@ -130,7 +137,10 @@ class RegistrationWidget(Container):
         
         
         self.extend([ registration_label, self.registration_checkbox, self.channel_to_register_dropdown, self.channel_to_register_to_dropdown,
-                    self.translate_x, self.translate_y, self.translate_z, self.scale_xy, self.rotate90_button, self.rotate_x, self.rotate_y, self.rotate_z, self.create_registered])
+                    self.translate_x, self.translate_y, self.translate_z, self.scale_xy, self.rotate90_button, self.flip_z_button, self.rotate_x, self.rotate_y, self.rotate_z, self.create_registered])
+
+    def flip_z(self):
+         self.viewer.layers[self.channel_to_register_dropdown.value].data = np.flip(self.viewer.layers[self.channel_to_register_dropdown.value].data,  axis=1)
                     
     def rotate90(self):
         # use np.rot to rotate the image in the registered channel
@@ -180,12 +190,14 @@ class RegistrationWidget(Container):
 
         # if rotation could add a center shift, rotate then unshift?
         angle = np.radians(self.rotate_z.value)
+        
+
         if angle > 0:
 
             # create a translation matrix
             move_to_center = np.eye(registered_affine.shape[0])
-            move_to_center[3, -1] -= channel_to_apply_affine.data.shape[1] / 2
-            move_to_center[4, -1] -= channel_to_apply_affine.data.shape[2] / 2
+            move_to_center[3, -1] -= channel_to_apply_affine.data.shape[3] / 2
+            move_to_center[4, -1] -= channel_to_apply_affine.data.shape[4] / 2
 
             # create a rotation matrix
             rotate = np.eye(registered_affine.shape[0])
@@ -196,14 +208,16 @@ class RegistrationWidget(Container):
             
             # np dot registered_affine_copy with a move back matrix
             move_back = np.eye(registered_affine.shape[0])
-            move_back[3, -1] += channel_to_apply_affine.data.shape[1] / 2
-            move_back[4, -1] += channel_to_apply_affine.data.shape[2] / 2
+            move_back[3, -1] += channel_to_apply_affine.data.shape[3] / 2
+            move_back[4, -1] += channel_to_apply_affine.data.shape[4] / 2
             
 
             r = np.dot(move_to_center, rotate)
             b = np.dot(r, move_back)
             registered_affine = np.dot(registered_affine, b)
 
+
+        
 
         channel_to_apply_affine.affine = registered_affine
 

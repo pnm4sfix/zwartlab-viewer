@@ -23,6 +23,7 @@ import numbers
 from tifffile import natural_sorted
 import caiman as cm
 from caiman.utils.visualization import get_contours
+from napari_video.napari_video import VideoReaderNP
 
 try: 
     import cupy as cp
@@ -32,16 +33,20 @@ try:
 except:
     print("No cupy")
     device = "cpu"
-    
 
-try:
-    print("Starting caiman cluster")
-    if 'dview' in locals():
-        cm.stop_server(dview=dview)
-    c, dview, n_processes = cm.cluster.setup_cluster(
-        backend='local', n_processes=None, single_thread=False)
-except:
-    pass
+## TO DO-refactor scanimage reader to be quicker
+        # get gpu working
+        # extract frame rate, num frames averaged and more metadata from scanimage tif
+        # find way of keeping image metadata in mmap and caiman hdf5 files so scaling is correct in napari
+
+#try:
+#    print("Starting caiman cluster")
+#    if 'dview' in locals():
+#        cm.stop_server(dview=dview)
+#    c, dview, n_processes = cm.cluster.setup_cluster(
+#        backend='local', n_processes=None, single_thread=False)
+#except:
+#    pass
     
 
 def napari_get_reader(path):
@@ -56,12 +61,41 @@ def napari_get_reader(path):
 
     # check if path is czi and return czi reader
     elif path[0].endswith(".czi"):
-        return czi_reader
+        return czi_reader_wrapper 
     
     elif (path[0].endswith(".hdf5")) | (path[0].endswith(".mmap")):
         return caiman_reader
 
+def czi_reader_wrapper(paths):
+    layer_data = czi_reader(paths)
+    
+    for nlayer, layer in enumerate(layer_data):
+        layer = list(layer)
+        
+        # set opacity to 0.5
+        layer[1]["opacity"] = 0.5
+        translate = layer[1]["translate"]
+        translate = tuple([translate[0], translate[1], 0.0, translate[2], translate[3]])
+        
+        scale = layer[1]["scale"]
+        scale = tuple([scale[0], scale[1], 1.0, scale[2], scale[3]])
+        
+        
+        layer[1]["translate"] = translate
+        layer[1]["scale"] = scale
+        layer[1]["name"] = layer[1]["name"][0]
+        layer[1].pop("channel_axis", None)
 
+        print(layer[1], layer[2])
+        ## reshape image to TZCYX
+        #T, Z, Y, X = layer[0].shape # assumes in format TZYX
+       # 
+        #layer[0] = layer[0].reshape(T, Z, 1, Y, X)
+        layer_data[nlayer] = tuple(layer)
+     
+    return layer_data
+        
+        
 
 def extract_metadata(im_path):
     """Arguments:
@@ -117,7 +151,7 @@ def get_xyz(tags, imagej_metadata):
     return np.array([z_um_px, y_um_px, x_um_px])
 
 
-def tif_reader(paths, lazy = True, gpu = False):
+def tif_reader(paths, lazy = True, device = "cpu"):
     layer_data = []
     if not isinstance(paths, list):
         paths = [paths]
@@ -141,7 +175,7 @@ def tif_reader(paths, lazy = True, gpu = False):
             im = extract_im(path)
 
             z, y, x = get_xyz(tags, imagej_metadata) # does this work for zbrain
-
+            print("ImageJ file shape is {}".format(im.shape))
             if axes == "ZYX":
                 # reshape to 5 dims of shape TZCYX
                 im = im.reshape(1, 1, *im.shape)
@@ -150,7 +184,7 @@ def tif_reader(paths, lazy = True, gpu = False):
                 # reshape to 5 dims of shape TZCYX
                 im = im.reshape(1, *im.shape)
                 scale = (1,1, z, y, x)
-                
+            print("ImageJ file shape is {}".format(im.shape))   
 
             if im.dtype == "uint16":
                 contrast_limits = (0, 2 ** 16 - 1)
@@ -174,7 +208,17 @@ def tif_reader(paths, lazy = True, gpu = False):
 
             if "H2B" in path:
                 # flip image along z axis with numpy flip
-                im = np.flip(im, axis=0)
+                print("Flipping image along z axis")
+                #im = np.flip(im, axis=0)
+
+        else:
+            print("Not sure what type of tif")
+            im = extract_im(path)
+            metadata = {
+                "name": "image",
+                
+                "opacity": 0.5
+            }
 
         
         layer_data.append((im, metadata, "image"))
@@ -183,8 +227,12 @@ def tif_reader(paths, lazy = True, gpu = False):
 
 
 
-def scanimage_reader(paths, lazy= True, device = "cpu"):
+def scanimage_reader(paths, volumes = 1, lazy= True, device = "cpu"):
     # for now ignore axes as seems incorrect
+    # TO_ DOget fr, averaging info
+    # Might have to import scanimage_read_frame here for parallel processing later
+    from ._utils import read_scanimage_frame
+    read_scanimage_frames = dask.delayed(read_scanimage_frame)
     print("Reading ScanImage File")
     layer_data = []
     if not isinstance(paths, list):
@@ -192,96 +240,135 @@ def scanimage_reader(paths, lazy= True, device = "cpu"):
 
     for path in paths:
         scanimage_file = ScanImageTiffReader(path)
-        block_size = int(scanimage_file.shape()[0] / 5)
-        if lazy:
-            # dask image
-            if device == "gpu":
-                im = lazy_scanimage_read(path, nframes = block_size, arraytype = "cupy")
-            elif device == "cpu":
-                im = lazy_scanimage_read(path, nframes = block_size)
-        else:
-            im = scanimage_file.data()
-            
         metadata = scanimage_file.metadata()
         main_metadata, roi_metadata = parse_scanimage_metadata(metadata)
         obj_res = get_objective_resolution(main_metadata)
-        if obj_res == 15: # maybe bemore specific
-            correction_factor = 4.62866667
-            #x, y = x*correction_factor, y * correction_factor
-            z, y, x = get_scanimage_resolution(main_metadata, roi_metadata, correction_factor)
-        else:
-            z, y, x = get_scanimage_resolution(main_metadata, roi_metadata)
+        imaging_rois = roi_metadata["RoiGroups"]["imagingRoiGroup"]["rois"]
+        n_imaging_rois = len(imaging_rois)
+     
         numSlices = get_Z(main_metadata)
         C = get_numchannels(main_metadata)
         
-        print("objective resolution was {}".format(obj_res))
-
-        
-            #pass # apply correction to y and x
-        
-        nframes, height, width = im.shape
-        remainder = nframes % numSlices
+        nframes, height, width = scanimage_file.shape()
+        remainder = nframes % (numSlices * C)
         full_length = nframes-remainder
 
         if full_length == nframes:
             print("No incomplete volumes")
         else:
             print("Incomplete volume")
-            im = im[:full_length]
+            #im = im[:full_length]
             
         nVols = int(full_length/numSlices)
         
         T, Z, Y, X = nVols, numSlices, height, width
         
         print("T {}, Z {}, C {}, Y {}, X {}".format(T, Z, C, Y, X))
-
-        #if len(im.shape) == 3:
-        # reshape to 5 dims of shape TZCYX
-        im = im.reshape(T, Z, C, Y, X)
-        scale = (1, z, 1, y, x)
-            
-        #elif len(im.shape) == 4:
-            # reshape to 5 dims of shape TZCYX
-            # if im is dask array:
-        #    im = im.reshape((T, Z, C, Y, X))
-            
-        #    scale = (1,1, z, y, x)
-
-        #if im.dtype == "uint16":
-            #contrast_limits = (0, 2 ** 16 - 1)
-        if type(im) == dask.array.core.Array:
-            # use first 100 for speed
-            in_mem_im_sub = im[:100].compute()
-            if type(in_mem_im_sub) != np.ndarray:
-                in_mem_im_sub = cp.asnumpy(in_mem_im_sub)
-            contrast_limits = (np.percentile(in_mem_im_sub, 10), np.percentile(in_mem_im_sub, 95))
-            #contrast_limits = (da.percentile(flat_im, 10).compute(), da.percentile(flat_im, 95).compute())
-        else:
-            contrast_limits = (np.percentile(im, 10), np.percentile(im, 95))
-
-        #elif im.dtype == "int16":
-        #    contrast_limits = -(2 ** 16 - 1)/2, (2 ** 16 - 1)/2
-        #    contrast_limits = (np.percentile(im, 10), np.percentile(im, 95))
-
-        #elif im.dtype == "uint8":
-        #    contrast_limits = (0, 2 ** 8 - 1)
-        #    contrast_limits = (np.percentile(im, 10), np.percentile(im, 95))
-        #else:
-        #    contrast_limits = None
-        print("contrast limit is {}".format(contrast_limits))
-
-        metadata = {
-            "name": "image",
-            "scale": scale,
-            "contrast_limits": contrast_limits,
-            "opacity": 0.5
-        }
         
-        layer_data.append((im, metadata, "image"))
+        print("objective resolution was {}".format(obj_res))
+
+        blocksize = volumes * Z * C
+        nblocks = int(np.ceil(full_length/blocksize))
+
+        blocks = [(n*blocksize, (n+1) * blocksize) for n in range(nblocks)]    
+        
+        if lazy:
+            if device == "gpu":
+                
+                im = da.concatenate([da.from_delayed(read_scanimage_frames(scanimage_file, start, end, cp.asanyarray), 
+                                                 shape = (blocksize, Y, X), dtype = "int16").reshape((1, Z, C, Y, X)) for start, end in blocks], axis=0)
+            elif device == "cpu":
+                im = da.concatenate([da.from_delayed(read_scanimage_frames(scanimage_file, start, end), 
+                                                 shape = (blocksize, Y, X), dtype = "int16").reshape((1, Z, C, Y, X)) for start, end in blocks], axis=0)
+
+        else:
+
+            im = scanimage_file.data()
+
+        # loop through each roi and create dask image, metadata and add as individual layer
+        # each scanfield may need new separate layer if in a different x, y or apply the affine beforehand?
+        
+
+        #pass # apply correction to y and x
+        #if obj_res == 15: # maybe bemore specific
+        #    correction_factor = 4.62866667
+        #else:
+        #    correction_factor = None
+        
+        # reshape to 5 dims of shape TZCYX
+        #im = im.reshape(T, Z, C, Y, X)
+        if type(imaging_rois) == list:
+            # get roi indices
+            zs = []
+            #zs = main_metadata['SI.hStackManager.zs '] # use this instead
+            for nroi, roi in enumerate(imaging_rois):
+                for zss in roi["zs"]:
+                    zs.append(zss)
+            
+            # then we have multiple rois - loop through and add as seperate layers
+            for nroi, roi in enumerate(imaging_rois):
+                t, z, y, x = get_scanimage_resolution(main_metadata, roi_metadata, roi = nroi)
+                contrast_limits = get_contrast_limits(im)
+                scale = (t, z, 1, y, x)
+                roi_zs = roi["zs"]
+                z_idx = np.where(np.isin(zs, roi_zs))[0]
+                
+                # subset im to get just the corresponding slices
+                roi_im = im[:, z_idx]
+                
+                # add affine here for each roi scanfield?
+                
+                print("contrast limit is {}".format(contrast_limits))
+
+                metadata = {
+                    "name": roi["name"],
+                    "scale": scale,
+                    "contrast_limits": contrast_limits,
+                    "opacity": 0.5
+                }
+        
+                layer_data.append((roi_im, metadata, "image"))
+                
+
+                
+
+        elif type(imaging_rois) == dict:
+            # then just one main imaging FOV
+
+
+
+        
+            #x, y = x*correction_factor, y * correction_factor
+            t, z, y, x = get_scanimage_resolution(main_metadata, roi_metadata)
+            contrast_limits = get_contrast_limits(im)
+        
+            scale = (t, z, 1, y, x)
+            
+            print("contrast limit is {}".format(contrast_limits))
+
+            metadata = {
+                "name": imaging_rois["name"],
+                "scale": scale,
+                "contrast_limits": contrast_limits,
+                "opacity": 0.5
+            }
+        
+            layer_data.append((im, metadata, "image"))
 
     return layer_data
 
+def get_contrast_limits(im):        
+    if type(im) == dask.array.core.Array:
+        # use first 100 for speed
+        in_mem_im_sub = im[:100].compute()
+        if type(in_mem_im_sub) != np.ndarray:
+            in_mem_im_sub = cp.asnumpy(in_mem_im_sub)
+        contrast_limits = (np.percentile(in_mem_im_sub, 10), np.percentile(in_mem_im_sub, 95))
+        #contrast_limits = (da.percentile(flat_im, 10).compute(), da.percentile(flat_im, 95).compute())
+    else:
+        contrast_limits = (np.percentile(im, 10), np.percentile(im, 95))
 
+    return contrast_limits
 
 
 def parse_scanimage_metadata(metadata):
@@ -300,28 +387,41 @@ def parse_scanimage_metadata(metadata):
 
     return main_metadata, roi_metadata  
 
-def get_scanimage_resolution(main_metadata, roi_metadata, xy_correction = 4.62866667):
-
+def get_scanimage_resolution(main_metadata, roi_metadata, obj_res = 69.4311, xy_correction = None, roi = None):
+    
+    # THIS NEEDS A LOTS OF WORK FOR COMPATIBILITY WITH MROI IMAGING
+    fr = float(main_metadata['SI.hRoiManager.scanVolumeRate '].split(' ')[-1])
+    #'SI.hRoiManager.scanVolumeRate ': ' 4.55824', #  for volume rate
     #xmin, ymin, xmax, ymax, tl, tr, bl, br
-    tl, tr, bl, br  = main_metadata["SI.hRoiManager.imagingFovUm "].replace(" [", "").replace("]", "").split(";")
-    xmin, ymin = tl.split(" ")
-    xmin, ymin = float(xmin), float(ymin)
+    imaging_rois = roi_metadata["RoiGroups"]["imagingRoiGroup"]["rois"]
+    if roi == None:
+        size_degrees = np.array(imaging_rois["scanfields"]["sizeXY"])
+        size_px = np.array(imaging_rois["scanfields"]["pixelResolutionXY"])
+        
+        try:
+            z_px_size = float(main_metadata["SI.hStackManager.actualStackZStepSize "]) # this will fail for MROI
+        except:
+            z_px_size = 1
+        
+    else:
+        # size / x_px or y_px
+        # 
+        size_degrees = np.array(imaging_rois[roi]["scanfields"][0]["sizeXY"])
+        size_px = np.array(imaging_rois[roi]["scanfields"][0]["pixelResolutionXY"])
+        zs = imaging_rois[roi]["zs"]
+        z_px_size = np.round(np.mean(np.diff(zs)))
+        print("Average step size for this roi is {}".format(z_px_size))
+        
+    degree_px = size_degrees/size_px
+    micron_px = degree_px * obj_res
+        
+    x_px_size = micron_px[0]
+    y_px_size = micron_px[1]
+    
 
-    xmax, ymax = bl.split(" ")
-    xmax, ymax = float(xmax), float(ymax)
+        
 
-    x_range, y_range = xmax-xmin, ymax-ymin
-
-
-    x_px, y_px = roi_metadata["RoiGroups"]["imagingRoiGroup"]["rois"]["scanfields"]["pixelResolutionXY"]
-
-    x_px_size = x_range / x_px
-    y_px_size = y_range / y_px
-
-
-    z_px_size = float(main_metadata["SI.hStackManager.actualStackZStepSize "])
-
-    return np.array([z_px_size, y_px_size * xy_correction, x_px_size * xy_correction])
+    return np.array([1/fr, z_px_size, y_px_size, x_px_size]) # sampling interval, z interval, y interval, x interval
 
 def get_Z(main_metadata):
     Z = int(main_metadata["SI.hStackManager.actualNumSlices "].replace(" [", "").replace("]", "").split(";")[0])
@@ -330,7 +430,7 @@ def get_Z(main_metadata):
 
 def get_objective_resolution(main_metadata):
     # Useful for correcting images with wrong calibration
-    obj_res = int(float(main_metadata["SI.objectiveResolution "].replace(" [", "").replace("]", "").split(";")[0]))
+    obj_res = float(float(main_metadata["SI.objectiveResolution "].replace(" [", "").replace("]", "").split(";")[0]))
     return obj_res
 
 def get_numchannels(main_metadata):
@@ -351,8 +451,9 @@ def get_numchannels(main_metadata):
 
 
 
-def lazy_scanimage_read(fname, nframes=1000, *, arraytype="numpy"): # maybe give option of using gpu - maybe a check box
+def lazy_scanimage_read(fname, nframes=1, *, arraytype="numpy"): # maybe give option of using gpu - maybe a check box
     """
+    This is not very performant
     Read image data into a Dask Array.
 
     Provides a simple, fast mechanism to ingest image data into a
@@ -451,12 +552,21 @@ def read_cnm_data(cnms):
     print("Reading cnm data")
     # get length of cnms
     layer_data = []
+    
+   
 
     T = cnms[0].estimates.C.shape[-1]
     Z = len(cnms)
     C = 1
-    Y = cnms[0].dims[0]
-    X = cnms[0].dims[1]
+    try:
+        Y = cnms[0].dims[0]
+        X = cnms[0].dims[1]
+        dims = cnms[0].dims
+    except:
+        # online cnmf doesnt store dims in self
+        Y = cnms[0].estimates.dims[0]
+        X = cnms[0].estimates.dims[1]
+        dims = cnms[0].estimates.dims
     
     # get num blocks frmo blocksize
     blocksize = 100
@@ -465,7 +575,7 @@ def read_cnm_data(cnms):
     blocks = [(n*blocksize, (n+1) * blocksize) for n in range(nblocks)]
     
     # get denoised dask array in TZCYX format
-    im = da.concatenate([da.stack([da.from_delayed(reconstruct_cnm(cnm, start, end), shape = (blocksize, 1, cnm.dims[0], cnm.dims[1]), dtype = np.float64) for cnm in cnms], axis=1) for start, end in blocks], axis=0)
+    im = da.concatenate([da.stack([da.from_delayed(reconstruct_cnm(cnm, start, end), shape = (blocksize, 1, dims[0], dims[1]), dtype = np.float64) for cnm in cnms], axis=1) for start, end in blocks], axis=0)
 
     # add extra shapes layer here for good components and bad components - make dask to extend in all dimensions lazily
     shape_layers = add_contour_layers(cnms)
@@ -547,6 +657,15 @@ def read_mmap_data(mmaps):
 def caiman_reader(paths, lazy= True, device = "cpu"):
     # might be worth adding dask array for shape layer for good components and bad components
 
+    #try:
+    #    print("Starting caiman cluster")
+    #    if 'dview' in locals():
+    #        cm.stop_server(dview=dview)
+    #    c, dview, n_processes = cm.cluster.setup_cluster(
+    #        backend='local', n_processes=None, single_thread=False)
+    #except:
+    #    pass
+
     print("Paths to caiman reader are {}".format(paths))
     layer_data = []
     if not isinstance(paths, list):
@@ -573,27 +692,44 @@ def caiman_reader(paths, lazy= True, device = "cpu"):
         mmap_layers = read_mmap_data(mmaps)
         layer_data.extend(mmap_layers)
         
+    #print("Stopping caiman cluster")
+    #if 'dview' in locals():
+    #    cm.stop_server(dview=dview)   
 
     return layer_data
 
 @dask.delayed
 def reconstruct_cnm(cnm, start, end):
     # this will index error if end > than C.shape[1]
+    try:
+        dims = cnm.dims
+    except:
+        dims = cnm.estimates.dims
+        
     return (cnm.estimates.A.dot(cnm.estimates.C[:, start:end]) + \
-                        cnm.estimates.b.dot(cnm.estimates.f[:, start:end])).reshape((cnm.dims[0], cnm.dims[1]) + (-1,), order='F').transpose([2, 0, 1]).reshape(-1, 1,  cnm.dims[0], cnm.dims[1])
+                        cnm.estimates.b.dot(cnm.estimates.f[:, start:end])).reshape((dims[0], dims[1]) + (-1,), order='F').transpose([2, 0, 1]).reshape(-1, 1,  dims[0], dims[1])
 @dask.delayed
 def reconstruct_mmap(mmap, dims, T, start, end):
     if end > T:
-        end = -1
+        diff = end - T
+        end = T
         # pad
-        pad = np.zeros((T-end, dims[0], dims[1], end-start))
+        pad = np.zeros((diff, dims[0], dims[1], end-start))
+        # concatenate pad - tbc
     return np.reshape(mmap.T[start:end], [int(end-start)] + list(dims), order='F').reshape(-1, 1, dims[0], dims[1]) #TZCYX
+
+
     
+
         
 
 def get_contour_data(cnm, cnm_idx):
-    
-    contours = get_contours(cnm.estimates.A, (cnm.dims[0], cnm.dims[1]), thr=0.9)
+    try:
+        dims = cnm.dims
+    except:
+        dims = cnm.estimates.dims
+
+    contours = get_contours(cnm.estimates.A, (dims[0], dims[1]), thr=0.9)
     # check previous usage
     good_shapes= []
     bad_shapes = []
@@ -656,9 +792,59 @@ def add_contour_layers(cnms):
 # create reader for memmap files
 # add delayed reader of contours
 
+# create video reader
+#@dask.delayed
+def read_vid_frame(fname, start, end):
+    vid = VideoReaderNP(fname)
+    vid = vid[start:end]
+    duration = int(end - start)
+    if len(vid.shape) == 3: # check if just 1 frame -add pad of 99
+        # pad
+        difference = duration - 1
+        pad = np.zeros((difference, *vid.shape))
+        vid = np.concatenate([vid.reshape((1, *vid.shape)), pad])
+        
+    if vid.shape[0] != duration: # check if less than 100 frames and add pad
+        difference = duration - vid.shape[0]
+        pad = np.zeros((difference, *vid.shape[1:]))
+        vid = np.concatenate([vid, pad])
+    # return in TZCYX shape
+    T, Y, X, C = vid.shape
+    # TYXC -> TZCYX
+    vid = vid.reshape((T, 1, Y, X, C))
+    # TZYXC -> TZCXY
+    vid = np.swapaxes(vid, 2, 4)
+    # TZCXY -> TZCYX
+    vid = np.swapaxes(vid, 3, 4)
+    
+    # probably convert to grayscale to save memory
+
+    return vid
+
+def read_video(fname, nframes):
+    vid = VideoReaderNP(fname)
+    # TYXC
+    T,Y,X,C = vid.shape
+    dtype = vid.dtype
+    
+    blocksize = nframes
+    nblocks = int(np.ceil(len(vid)/blocksize))
+    blocks = [(n*blocksize, (n+1) * blocksize) for n in range(nblocks)] # add trial here
+
+    delayed_vid_reader = dask.delayed(read_vid_frame)
+    
+    vid_da = da.concatenate([da.from_delayed(delayed_vid_reader(fname, start, end), shape = (blocksize, 1, C, Y, X), dtype =
+            dtype) for start, end in blocks])
+
+    return vid_da
+
+def read_stim_zarr(fname):
+    return da.from_zarr(fname)
 
 
-
+# create a reader for ephys.blk file
+def read_ephys(fname, start, end):
+    pass
 
 
 

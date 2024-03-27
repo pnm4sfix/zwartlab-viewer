@@ -31,6 +31,7 @@ import cupy as cp
 import caiman as cm
 import ipyparallel as ipp
 from ._reader import read_cnm_data, napari_get_reader
+from caiman.source_extraction.cnmf import params as params
 from tifffile import natural_sorted
 if cp.cuda.Device():
     
@@ -86,7 +87,7 @@ class CaimanWidget(Container):
         self.gSig_wid = SpinBox(value = 3, label = "gSig", tooltip = "gSig")
         self.mot_corr_wid = CheckBox(value = False, label = "mot_corr", tooltip = "mot_corr")
         self.max_shifts_online_wid = SpinBox(value = 100, label = "max_shifts", tooltip = "max_shifts_online")
-        self.sniper_mode_wid = CheckBox(value = True, label = "sniper_mode", tooltip = "sniper_mode")
+        self.sniper_mode_wid = CheckBox(value = False, label = "sniper_mode", tooltip = "sniper_mode")
         self.init_batch_wid = SpinBox(value = 200, label = "init_batch", tooltip = "init_batch")
         #self.allow_overlap_wid = CheckBox(value = False, label = "allow_overlap", tooltip = "allow_overlap")
         self.K_wid = SpinBox(value = 20, label = "K", tooltip = "K")
@@ -172,8 +173,10 @@ class CaimanWidget(Container):
         self.get_params()    
     
         if self.mode == "online":
-            #self.parallel_caiman_online(self.fnames)
-            self.run_single_test(self.fnames)
+            if len(self.fnames) > 1:
+                self.parallel_caiman_online(self.fnames)
+            elif len(self.fnames) == 1:
+                self.run_single_test(self.fnames)
             
         elif self.mode == "batch":
             #self.caiman_batch
@@ -181,26 +184,31 @@ class CaimanWidget(Container):
         
     @staticmethod
     def run_cnmf_online(fname, params_dict):
+        # issue with running with sniper mode - tensorflow not playing ball with ipp
         import numpy as np
+        
         from caiman.source_extraction.cnmf import cnmf as cnmf
         from caiman.source_extraction.cnmf import online_cnmf as o_cnmf
         from caiman.source_extraction.cnmf import params as params
+        
 
-        #opts = cnmf.params.CNMFParams(params_dict=params_dict)
+        
         params_dict["fnames"] = [fname]
         opts = params.CNMFParams(params_dict=params_dict)
         # %% fit online
         
         cnm = o_cnmf.OnACID(params=opts)#, dview = dview)
-        #print("Fitting with OnACID")
+        
+        print("Fitting with OnACID")
         cnm.fit_online()
-        #print("Fitting finished")
+        print("Fitting finished")
         #UNCOMMENT AFTER TESTING
-        outfile = fname[:-5]+ "_online.hdf5"
-        #cnm.save(fname[:-5]+ "_online.hdf5")
-        return outfile
+        #outfile = fname[:-5] + "_online.hdf5"
+        #cnm.save(outfile)
+        return cnm
         
     def run_single_test(self, fnames):
+        # defunct
         print("Caiman unit test")
         # This assumes files are saved to disk as tif or mmap
         fnames = [str(fname) for fname in fnames]
@@ -230,19 +238,24 @@ class CaimanWidget(Container):
                        'save_online_movie': False}
         
         print(params_dict)
-        for key, value in params_dict.items():
-            print(type(key), type(value))
+        
             
-        self.run_cnmf_online(fnames[0], params_dict)
+        cnm = self.run_cnmf_online(fnames[0], params_dict)
+        self.cnms = [cnm]
+        self.evaluate_new_cnms(fnames, params_dict)
+        self.add_cnms_to_viewer()
         
 
     def parallel_caiman_online(self, fnames):
         print("Caiman online parallel")
+        # So I can run this in parallel on the VM but not laptop
+        # I can run a single unit test on laptop        
+
         # This assumes files are saved to disk as tif or mmap
         fnames = [str(fname) for fname in fnames]
         #define parameter dict here
 
-        params_dict = {'fnames': [],
+        params_dict = {'fnames': [fnames],
                        'fr': self.fr,
                        'decay_time': self.decay_time,
                        'gSig': self.gSig,
@@ -266,26 +279,51 @@ class CaimanWidget(Container):
                        'save_online_movie': False}
         
         print(params_dict)
-        for key, value in params_dict.items():
-            print(type(key), type(value))
+        
 
         with ipp.Cluster(n=len(fnames)) as rc:
+            #push param dict
+            rc[:].push(params_dict)          
             # get a view on the cluster
             view = rc.load_balanced_view()
-            #push param dict
-            rc[:].push(dict(params_dict=params_dict))            
-
+            #args = [[v] * len(fnames) for k, v in params_dict.items()]
+            params_dicts = [params_dict] * len(fnames)  
+            # ok pushing to cluster not working - try multiply all arguments by lenght of fnames
+            # must be some issue with doing it within a class?
             # submit the tasks
-            asyncresult = view.map_async(self.run_cnmf_online, fnames, params_dict)
+            asyncresult = view.map_async(self.run_cnmf_online, fnames, params_dicts)
             # wait interactively for results
             print("Waiting for results")
             asyncresult.wait_interactive()
             # retrieve actual results
-            cnms = asyncresult.get()
+            self.cnms = asyncresult.get()
         print("Online analysis finished")
+        print(self.cnms)
+        
+        # evaluate components in cnms to use cnn as sniper mode doesnt work
+        # load memmap
+        
+        # reshape
+        self.evaluate_new_cnms(fnames, params_dict)
+        self.add_cnms_to_viewer()
+        
+        # save cnms
+        
+        #opts = cnms[0].estimates.CNMFParams(params_dict=params_dict)
+    def evaluate_new_cnms(self, fnames, params_dict):
+        for cnm_idx, cnm in enumerate(self.cnms):
+            fname = fnames[cnm_idx]
+            params_dict["fnames"] = [fname] #this assumes fname is mmap but sometime this is raw tiff
+            opts = params.CNMFParams(params_dict=params_dict)
+            Yr, dims, T = cm.load_memmap(fname) 
+            images = Yr.T.reshape((T,) + dims, order='F')
+            # loop through cnms.estimates and do cnm.estimates.evaluate_components(images, opts)
+            # should use DNN
+            self.cnms[cnm_idx].estimates.evaluate_components(images, opts)
             
+    def add_cnms_to_viewer(self):
         # result should contain cnm objects
-        layer_data = read_cnm_data(cnms)
+        layer_data = read_cnm_data(self.cnms)
 
         # loop through and add layers to viewer
         print("Adding analysis layers")

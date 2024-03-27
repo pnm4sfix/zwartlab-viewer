@@ -26,7 +26,9 @@ https://napari.org/stable/plugins/index.html
     
     conda activate ZwartlabViewer
 
-    conda install -c "nvidia/label/cuda-11.7.0" cuda
+    conda install pytorch torchvision torchaudio pytorch-cuda=11.7 -c pytorch -c nvidia
+
+    #conda install -c "nvidia/label/cuda-11.7.0" cuda
 
     conda install -c conda-forge cupy
 

@@ -26,6 +26,10 @@ contributions:
       python_name: zwartlab_viewer._decomposition_widget:DecompositionWidget
       title: Make decomposition widget
 
+    - id: zwartlab-viewer.make_1d_widget
+      python_name: zwartlab_viewer._1d_widget:d1Widget
+      title: Make dff widget
+
     - id: zwartlab-viewer.napari_get_reader
       python_name: zwartlab_viewer._reader:napari_get_reader
       title: Read czi, scanimage or imagej tiff and load with correct scale parameters in microns
@@ -47,6 +51,7 @@ contributions:
       display_name: Stimulus
     - command: zwartlab-viewer.make_decomposition_widget
       display_name: Decomposition
-    
+    - command: zwartlab-viewer.make_1d_widget
+      display_name: 1d
     
 
